@@ -45,6 +45,8 @@ class FakeStore:
     def __init__(self) -> None:
         self.writes: Counter[str] = Counter()
         self.quotes: list[dict] = []
+        # Set to refuse every cart, as the store does one it can't make.
+        self.refuse_quotes = False
         # The order's support record, as GET /orders/{key}/support returns it.
         self.record = {"paid": 48.24, "refunded": 0.0, "refundable": 48.24, "remediations": []}
 
@@ -72,6 +74,10 @@ class FakeStore:
             return httpx.Response(200, json={"stardust": member["stardust"], "rewards": member["rewards"]})
         if path == "/quotes":
             body = json.loads(request.content)
+            if body["memberId"] != member["id"] or body["cafeId"] != cafe["id"]:
+                return httpx.Response(422, json={"title": "Cart refused", "errors": ["quoted for the wrong member or café"]})
+            if self.refuse_quotes:
+                return httpx.Response(422, json={"title": "Cart refused", "errors": ["Nebula Latte is not on the menu today"]})
             count = sum(line["qty"] for line in body["lines"])
             quote = {"quoteId": f"q-{len(self.quotes)}", "lines": body["lines"], "itemCount": count, "subtotal": count, "total": count, "earns": count * 10, "reward": None}
             self.quotes.append(quote)
@@ -220,6 +226,25 @@ async def test_a_stale_payment_is_ignored_and_a_message_gets_a_reply(env: Workfl
         assert [msg["from"] for msg in m["messages"]] == ["member", "ziggy", "member", "ziggy"]
         assert not store.writes, "a payment for another cart charged nothing"
         await handle.terminate("test done")
+
+
+def test_the_order_tools_never_ask_the_model_who_or_where():
+    req = OrderRequest(member_id="zora-vex", cafe_id="titan-ring", text="")
+    specs = {t.tool_name: t.tool_spec["inputSchema"]["json"].get("properties", {}) for t in CrewOrderWorkflow._tools(object(), req)}  # type: ignore[arg-type]
+    assert set(specs) == {"get_recent_orders", "get_menu", "get_stock", "get_rewards", "quote_cart"}
+    assert set(specs["quote_cart"]) == {"lines", "reward_id"}
+    assert not any(specs[name] for name in specs if name != "quote_cart"), specs
+
+
+async def test_a_refused_cart_reaches_the_model_with_the_stores_reason(env: WorkflowEnvironment, store: FakeStore):
+    store.refuse_quotes = True
+    async with worker(env.client, "sandbox-1"):
+        handle = await start(env.client)
+        m = await wait_for_phase(env, handle, "chat")
+        await handle.terminate("test done")
+    assert m.get("quote") is None, "a refused cart is never offered for payment"
+    assert m["work"][-1] == {**m["work"][-1], "tool": "quote_cart", "status": "failed"}
+    assert "Nebula Latte is not on the menu today" in m["messages"][-1]["text"]
 
 
 # ---------- the support chat ----------

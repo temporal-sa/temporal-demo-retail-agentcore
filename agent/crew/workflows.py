@@ -30,11 +30,13 @@ from typing import Any
 from temporalio import workflow
 from temporalio.common import RetryPolicy
 
+from temporalio.exceptions import ActivityError, ApplicationError
+
 with workflow.unsafe.imports_passed_through():
+    from strands import tool
     from strands.hooks import HookProvider, HookRegistry
     from strands.hooks.events import AfterToolCallEvent
     from temporalio.strands_agents import TemporalAgent
-    from temporalio.strands_agents.workflow import activity_as_tool
 
     from . import activities
     from .models import MODEL_NAME
@@ -95,10 +97,9 @@ class OrderResult:
     order_number: str = ""
 
 
-def _tool_activity(fn: Any) -> Any:
-    # The store answers in well under a second. Ten seconds covers a slow
-    # call; five attempts cover a store restart.
-    return activity_as_tool(fn, start_to_close_timeout=timedelta(seconds=10), retry_policy=RetryPolicy(maximum_attempts=5))
+# The store answers in well under a second. Ten seconds covers a slow call;
+# five attempts cover a store restart.
+TOOL_ACTIVITY = {"start_to_close_timeout": timedelta(seconds=10), "retry_policy": RetryPolicy(maximum_attempts=5)}
 
 
 @workflow.defn
@@ -119,7 +120,7 @@ class CrewOrderWorkflow:
             start_to_close_timeout=timedelta(seconds=60),
             retry_policy=RetryPolicy(maximum_attempts=5),
             system_prompt=SYSTEM_PROMPT,
-            tools=[_tool_activity(t) for t in activities.TOOLS],
+            tools=self._tools(req),
             hooks=[Progress(self)],
             # Strands prints the stream to stdout by default, on every replay too.
             callback_handler=None,
@@ -128,8 +129,7 @@ class CrewOrderWorkflow:
     @workflow.run
     async def run(self, req: OrderRequest) -> OrderResult:
         self._say("member", req.text)
-        prompt = f"Member member_id={req.member_id} is ordering for pickup at cafe_id={req.cafe_id}. Their message: {req.text}"
-        reply = await self._agent.invoke_async(prompt)
+        reply = await self._agent.invoke_async(f"The member is ordering for pickup. Their message: {req.text}")
         self._publish(model=self._agent.model.get_config().get("model_id"))
 
         # Wait for the member: Pay, or a message asking for a change. This is
@@ -216,6 +216,70 @@ class CrewOrderWorkflow:
             return
         self._ready = True
 
+    # ---------- the agent's tools ----------
+
+    def _tools(self, req: OrderRequest) -> list[Any]:
+        """The agent's tools, bound to this order's member and café.
+
+        The model chooses when to call them and, for quote_cart, the cart and
+        the reward. It never names the member or the café: those come from
+        the Workflow's input, so a prompt can't point a tool at another
+        member's orders or price a cart somewhere else.
+        """
+        wf = self
+
+        @tool
+        async def get_recent_orders() -> dict[str, Any]:
+            """List the member's most recent orders, newest first, with every line, its options and notes."""
+            return await wf._store(activities.get_recent_orders, req.member_id)
+
+        @tool
+        async def get_menu() -> dict[str, Any]:
+            """Read the pickup café's menu: every item's price, ingredients and options, and what each option changes."""
+            return await wf._store(activities.get_menu, req.cafe_id)
+
+        @tool
+        async def get_stock() -> dict[str, Any]:
+            """Read which ingredients the pickup café is out of today, and how long pickup takes."""
+            return await wf._store(activities.get_stock, req.cafe_id)
+
+        @tool
+        async def get_rewards() -> dict[str, Any]:
+            """Read the member's Stardust balance and the rewards they can use, with each reward's rule."""
+            return await wf._store(activities.get_rewards, req.member_id)
+
+        @tool
+        async def quote_cart(lines: list[activities.CartLine], reward_id: str = "best") -> dict[str, Any]:
+            """Price a cart at the pickup café and apply a reward. Refuses, listing every problem, if an item, option or ingredient isn't available.
+
+            The answer lists each line's price and ingredients, whether it is vegan,
+            every reward with what it would save, and the total. The member sees and
+            pays for the last cart you price.
+
+            Args:
+                lines: The cart. Each line has item_id, qty, options (option IDs from the menu, such as milk:almond) and note (who it is for, if anyone).
+                reward_id: A reward ID, "best" for the one that saves the most, or "" for none.
+            """
+            quote = await wf._store(activities.quote_cart, req.cafe_id, req.member_id, lines, reward_id)
+            if quote.get("status") != "error":
+                wf._quote = quote
+                wf._publish(quote=quote)
+            return quote
+
+        return [get_recent_orders, get_menu, get_stock, get_rewards, quote_cart]
+
+    async def _store(self, fn: Any, *args: Any) -> dict[str, Any]:
+        """Run a tool's store Activity. A failure goes back to the model as the tool's result, so it can fix the cart and try again."""
+        try:
+            return await workflow.execute_activity(fn, args=list(args), **TOOL_ACTIVITY)
+        except ActivityError as err:
+            # ActivityError's own message is generic; the cause holds the store's answer.
+            cause = err.cause
+            message = cause.message if isinstance(cause, ApplicationError) else str(cause or err)
+            return {"status": "error", "content": [{"text": message}]}
+
+    # ---------- state the page reads ----------
+
     def _say(self, who: str, text: str) -> None:
         if text:
             self._publish(messages=self._memo["messages"] + [{"from": who, "text": text, "at": workflow.now().isoformat()}])
@@ -231,7 +295,7 @@ class CrewOrderWorkflow:
 
 
 class Progress(HookProvider):
-    """Copies each tool call into the memo, and keeps the latest priced cart."""
+    """Copies each tool call into the memo."""
 
     def __init__(self, wf: CrewOrderWorkflow) -> None:
         self._wf = wf
@@ -249,9 +313,5 @@ class Progress(HookProvider):
                 body = json.loads(text)
             except ValueError:
                 pass
-        name = event.tool_use["name"]
-        if ok and name == activities.quote_cart.__name__:
-            self._wf._quote = body
-            self._wf._publish(quote=body)
-        step = {"tool": name, "status": "completed" if ok else "failed", "text": body.get("summary", text[:300]), "at": workflow.now().isoformat()}
+        step = {"tool": event.tool_use["name"], "status": "completed" if ok else "failed", "text": body.get("summary", text[:300]), "at": workflow.now().isoformat()}
         self._wf._publish(work=self._wf._memo["work"] + [step])

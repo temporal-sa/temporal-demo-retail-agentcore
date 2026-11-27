@@ -177,7 +177,7 @@ Line links point at paths on `main` until the first commit; replace them with co
 
 **When:** "What did it take to make the agent durable?"
 
-**Where:** [`agent/crew/workflows.py:114-126`](agent/crew/workflows.py#L114-L126) (`code -g agent/crew/workflows.py:114`)
+**Where:** [`agent/crew/workflows.py:114-126`](agent/crew/workflows.py#L114-L126) and the tools at [`221-269`](agent/crew/workflows.py#L221-L269) (`code -g agent/crew/workflows.py:114`)
 
 ```python
 self._agent = TemporalAgent(
@@ -185,17 +185,19 @@ self._agent = TemporalAgent(
     start_to_close_timeout=timedelta(seconds=60),
     retry_policy=RetryPolicy(maximum_attempts=5),
     system_prompt=SYSTEM_PROMPT,
-    tools=[_tool_activity(t) for t in activities.TOOLS],
+    tools=self._tools(req),
     hooks=[Progress(self)],
     callback_handler=None,
 )
 ```
 
 **What to understand:** `TemporalAgent` is a Strands `Agent` whose model calls run as the plugin's
-`invoke_model` Activity, and `activity_as_tool` (in `_tool_activity`) makes each tool an Activity.
-The tools are ordinary async functions with docstrings that call the store's REST API; Strands
-builds their schemas. The model name maps to a factory registered on the Worker, so the Bedrock
-client lives on the Worker, never in the Workflow. Docs:
+`invoke_model` Activity. The tools are Strands `@tool` functions defined in the Workflow, and each
+one runs its store call as an Activity. They close over the order's member and café, so the model
+picks only the cart and the reward and never names who or where: a prompt can't point a tool at
+another member's orders. Strands builds each tool's schema from its docstring. The model name maps
+to a factory registered on the Worker, so the Bedrock client lives on the Worker, never in the
+Workflow. Docs:
 [temporalio-strands-agents](https://pypi.org/project/temporalio-strands-agents/).
 
 ### Wait for the member with nothing running

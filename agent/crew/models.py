@@ -126,11 +126,6 @@ def _tool_results(messages: Messages) -> dict[str, dict[str, Any]]:
 def next_step(messages: Messages) -> tuple[str, tuple[str, dict[str, Any]] | None]:
     """The stub's answer to the conversation so far: text, and a tool call or None."""
     first = _text(messages[0])
-    member = re.search(r"member_id=([a-z0-9-]+)", first)
-    cafe = re.search(r"cafe_id=([a-z0-9-]+)", first)
-    if not member or not cafe:
-        return "I can't tell who is ordering or where, so I can't build the order.", None
-    member_id, cafe_id = member.group(1), cafe.group(1)
     last = messages[-1]
     is_user_text = last.get("role") == "user" and not any("toolResult" in b for b in last.get("content", []))
 
@@ -150,19 +145,19 @@ def next_step(messages: Messages) -> tuple[str, tuple[str, dict[str, Any]] | Non
 
     done = _tool_results(messages)
     if "get_recent_orders" not in done:
-        return "Checking your recent orders.", ("get_recent_orders", {"member_id": member_id})
+        return "Checking your recent orders.", ("get_recent_orders", {})
     if "get_menu" not in done:
-        return "Reading today's menu.", ("get_menu", {"cafe_id": cafe_id})
+        return "Reading today's menu.", ("get_menu", {})
     if "get_stock" not in done:
-        return "Checking what the café has in stock.", ("get_stock", {"cafe_id": cafe_id})
+        return "Checking what the café has in stock.", ("get_stock", {})
     if "get_rewards" not in done:
-        return "Looking at your rewards.", ("get_rewards", {"member_id": member_id})
+        return "Looking at your rewards.", ("get_rewards", {})
     failed = [name for name, r in done.items() if r["status"] != "success" and name != "quote_cart"]
     if failed:
         return f"I couldn't read what I need from the store ({', '.join(failed)}), so I can't build the order yet.", None
     if "quote_cart" not in done:
         lines, changes = build_cart(first, done)
-        return "Pricing the cart.", ("quote_cart", {"cafe_id": cafe_id, "member_id": member_id, "lines": lines, "reward_id": "best"})
+        return "Pricing the cart.", ("quote_cart", {"lines": lines, "reward_id": "best"})
     quote = done["quote_cart"]
     if quote["status"] != "success":
         return f"I couldn't price the order: {quote['body'].get('error', 'unknown problem')}.", None

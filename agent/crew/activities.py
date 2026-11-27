@@ -1,10 +1,10 @@
 """The agent's Activities: every call to the store API is one.
 
-Two kinds:
+Three kinds:
 
-- TOOLS are the agent's tools. The Workflow hands them to the Strands agent
-  with `activity_as_tool`, so the model decides when to call them, and
-  Strands builds each tool's description from its docstring.
+- TOOLS run the agent's tools. The tools themselves are in the Workflow
+  (workflows.py), bound to the order's member and café: the model decides
+  when to call one, and the Workflow fills in who and where.
 - CHECKOUT runs after the member pays, called by the Workflow itself, never
   by the model. Each sends the Workflow ID as its Idempotency-Key, so a
   retried attempt gets the store's stored result instead of a second charge.
@@ -89,11 +89,7 @@ def _money(v: Any) -> str:
 
 @activity.defn
 async def get_recent_orders(member_id: str) -> dict[str, Any]:
-    """List the member's most recent orders, newest first, with every line, its options and notes.
-
-    Args:
-        member_id: The member's ID, from the request.
-    """
+    """The member's five most recent orders, newest first."""
     body, _ = await _call("GET", f"/members/{member_id}/orders", params={"limit": 5})
     newest = body["orders"][0] if body["orders"] else None
     items = sum(line["qty"] for line in newest["lines"]) if newest else 0
@@ -103,11 +99,7 @@ async def get_recent_orders(member_id: str) -> dict[str, Any]:
 
 @activity.defn
 async def get_menu(cafe_id: str) -> dict[str, Any]:
-    """Read a café's menu: every item's price, ingredients and options, and what each option changes.
-
-    Args:
-        cafe_id: The pickup café's ID.
-    """
+    """A café's menu, with each item's ingredients and options."""
     body, _ = await _call("GET", f"/cafes/{cafe_id}/menu")
     body["summary"] = f"{body['cafeName']} menu: {len(body['items'])} items"
     return body
@@ -115,11 +107,7 @@ async def get_menu(cafe_id: str) -> dict[str, Any]:
 
 @activity.defn
 async def get_stock(cafe_id: str) -> dict[str, Any]:
-    """Read which ingredients a café is out of today, and how long pickup takes.
-
-    Args:
-        cafe_id: The pickup café's ID.
-    """
+    """What a café is out of today, and its pickup time."""
     body, _ = await _call("GET", f"/cafes/{cafe_id}/stock")
     out = ", ".join(body["outOfStock"]) or "nothing"
     body["summary"] = f"{body['cafeName']} is out of {out} today"
@@ -128,30 +116,15 @@ async def get_stock(cafe_id: str) -> dict[str, Any]:
 
 @activity.defn
 async def get_rewards(member_id: str) -> dict[str, Any]:
-    """Read the member's Stardust balance and the rewards they can use, with each reward's rule.
-
-    Args:
-        member_id: The member's ID.
-    """
+    """The member's Stardust balance and rewards."""
     body, _ = await _call("GET", f"/members/{member_id}/rewards")
     body["summary"] = f"{len(body['rewards'])} rewards, {body['stardust']} Stardust"
     return body
 
 
 @activity.defn
-async def quote_cart(cafe_id: str, member_id: str, lines: list[CartLine], reward_id: str = "best") -> dict[str, Any]:
-    """Price a cart at a café and apply a reward. Refuses, listing every problem, if an item, option or ingredient isn't available.
-
-    The answer lists each line's price and ingredients, whether it is vegan,
-    every reward with what it would save, and the total. The member sees and
-    pays for the last cart you price.
-
-    Args:
-        cafe_id: The pickup café's ID.
-        member_id: The member's ID.
-        lines: The cart. Each line has item_id, qty, options (option IDs from the menu, such as milk:almond) and note (who it is for, if anyone).
-        reward_id: A reward ID, "best" for the one that saves the most, or "" for none.
-    """
+async def quote_cart(cafe_id: str, member_id: str, lines: list[CartLine], reward_id: str) -> dict[str, Any]:
+    """Price a cart for a member at a café, with a reward ID, "best", or "" for none. The store refuses, listing every problem, a cart it can't make."""
     payload = {
         "cafeId": cafe_id,
         "memberId": member_id,
