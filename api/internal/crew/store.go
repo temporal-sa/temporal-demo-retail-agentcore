@@ -97,6 +97,20 @@ func (c *StoreClient) Profile(ctx context.Context, memberID, cafeID string) (*Pr
 	return p, nil
 }
 
+// SupportRecord is what support has done for an order, from every chat:
+// the store's record, passed through to the page.
+type SupportRecord = json.RawMessage
+
+// Record returns the order's support record. Before the order is paid the
+// store has none and answers 404, an error here.
+func (c *StoreClient) Record(ctx context.Context, orderKey string) (SupportRecord, error) {
+	var rec json.RawMessage
+	if err := c.get(ctx, "/orders/"+url.PathEscape(orderKey)+"/support", &rec); err != nil {
+		return nil, err
+	}
+	return rec, nil
+}
+
 func (c *StoreClient) Ledger(ctx context.Context, key string) (*Ledger, error) {
 	var l Ledger
 	if err := c.get(ctx, "/ledger/"+url.PathEscape(key), &l); err != nil {

@@ -9,7 +9,9 @@ const SLOW_POLL_MS = 4000;
 
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
-const state = { orderId: params.get("order"), supportId: params.get("support"), view: null, pending: null, pendingSupport: null, paying: false, sending: false, marking: false, choosing: false, reviewing: false, timer: null };
+const state = { orderId: params.get("order"), supportId: params.get("support"), view: null, pending: null, pendingSupport: null, paying: false, sending: false, marking: false, choosing: false, reviewing: false, timer: null,
+  // The "What went wrong?" card: item ID -> "missing" or "wrong", and whether the member chose to type instead.
+  picks: {}, chatting: false, reporting: false };
 
 // ---------- small DOM helpers ----------
 function el(tag, attrs = {}, ...children) {
@@ -83,6 +85,9 @@ function setSupport(id) {
   state.pendingSupport = null;
   state.choosing = false;
   state.reviewing = false;
+  state.picks = {};
+  state.chatting = false;
+  state.reporting = false;
   const url = new URL(location.href);
   for (const [k, v] of [["order", state.orderId], ["support", id]]) {
     if (v) url.searchParams.set(k, v);
@@ -171,6 +176,58 @@ async function choose(optionId) {
     $("error-banner").hidden = false;
   }
   poll();
+}
+
+async function report(scope) {
+  const items = scope === "items" ? Object.entries(state.picks).map(([itemId, problem]) => ({ itemId, problem })) : [];
+  state.reporting = true;
+  render();
+  try {
+    await api("POST", supportPath("report"), { scope, items });
+  } catch (err) {
+    state.reporting = false;
+    $("error-text").textContent = `Report not sent: ${err.message}`;
+    $("error-banner").hidden = false;
+  }
+  poll();
+}
+
+// Items support already put right for this order, from any chat.
+function settledItems(record) {
+  const done = {};
+  for (const r of record?.remediations || []) {
+    for (const item of r.items || []) {
+      if (r.kind === "refund") done[item] = "Refunded";
+      else if (r.kind === "comp") done[item] ??= "Remade";
+    }
+  }
+  return done;
+}
+
+function reportCard(o, record) {
+  const done = settledItems(record);
+  const lines = o?.quote?.lines || [];
+  const picked = Object.keys(state.picks).length;
+  const busy = state.reporting;
+  return el("section", { class: "report-card", "aria-label": "What went wrong?" },
+    el("h3", { text: "What went wrong?" }),
+    el("p", { class: "report-hint", text: "Pick the items, or choose below." }),
+    el("ul", { class: "report-items" }, lines.map((l) => {
+      const problem = state.picks[l.itemId];
+      return el("li", { class: "report-item", "data-picked": problem ? "" : null },
+        el("button", { type: "button", class: "report-pick", "data-action": "pick-item", "data-item": l.itemId, "aria-pressed": problem ? "true" : "false", disabled: busy || !!done[l.itemId] },
+          el("span", { class: "report-box", "aria-hidden": "true", text: problem ? "✓" : "" }),
+          el("span", { class: "report-name", text: `${l.qty}× ${l.name || l.itemId}` }),
+          done[l.itemId] ? el("span", { class: "report-done", text: done[l.itemId] }) : null),
+        problem ? el("div", { class: "report-problems", role: "group", "aria-label": `What was wrong with the ${l.name}` },
+          [["missing", "Missing"], ["wrong", "Wrong item"]].map(([p, label]) =>
+            el("button", { type: "button", "data-action": "pick-problem", "data-item": l.itemId, "data-problem": p, "aria-pressed": problem === p ? "true" : "false", disabled: busy, text: label }))) : null);
+    })),
+    el("button", { type: "button", class: "app-btn pay", "data-action": "report-items", disabled: busy || !picked, text: picked ? `Report ${picked} item${picked > 1 ? "s" : ""}` : "Pick an item" }),
+    el("div", { class: "report-more" },
+      el("button", { type: "button", class: "app-btn alt", "data-action": "report-scope", "data-scope": "order", disabled: busy, text: "Issue with the entire order" }),
+      el("button", { type: "button", class: "app-btn alt", "data-action": "report-scope", "data-scope": "service", disabled: busy, text: "Issue with the service" }),
+      el("button", { type: "button", class: "app-btn alt", "data-action": "chat", disabled: busy, text: "Chat about it" })));
 }
 
 async function review(approve) {
@@ -357,9 +414,13 @@ function drawChat(chat, items) {
   if (html === chat.lastHtml) return;
   const atBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 40;
   const top = chat.scrollTop;
+  // Keep keyboard focus on the same button through the redraw.
+  const focused = chat.contains(document.activeElement) ? document.activeElement : null;
+  const sameButton = focused && ["action", "item", "problem", "option", "scope"].map((k) => focused.dataset[k] ? `[data-${k}="${focused.dataset[k]}"]` : "").join("");
   chat.replaceChildren(...items);
   chat.lastHtml = html;
   chat.scrollTop = atBottom ? chat.scrollHeight : top;
+  if (sameButton) chat.querySelector(sameButton)?.focus({ preventScroll: true });
 }
 
 // Buttons inside the phone are handled by one listener on the chat (see
@@ -375,6 +436,10 @@ function renderSupportPhone(view, o, s, m) {
       s.offer.map((opt) => el("button", { type: "button", class: `app-btn ${opt.id === "other" ? "alt" : "pay"}`, "data-action": "choose", "data-option": opt.id, disabled: state.choosing, text: opt.label }))));
   }
   if (!s.offer || s.phase !== "choosing") state.choosing = false;
+  // The card stays until the member reports or types their first message.
+  const reported = (s.messages || []).slice(2).some((msg) => msg.from === "member");
+  if (reported) state.reporting = false;
+  if (open && s.phase === "listening" && !reported && !state.chatting) items.push(reportCard(o, view.record || s.record));
   if (open && ["thinking", "resolving"].includes(s.phase)) items.push(zigLine(null));
   if (!open) items.push(el("p", { class: "chat-closed", role: "status", text: "Chat closed" }), helpButton());
   drawChat($("chat"), items);
@@ -383,7 +448,7 @@ function renderSupportPhone(view, o, s, m) {
   const canMessage = open && ["listening", "choosing"].includes(s.phase) && !state.sending;
   text.disabled = !canMessage;
   $("composer-send").disabled = text.disabled;
-  text.placeholder = !open ? "Chat closed" : s.phase === "choosing" ? "Pick an option, or type" : canMessage ? "Tell Ziggy what went wrong" : "Ziggy is working";
+  text.placeholder = !open ? "Chat closed" : s.phase === "choosing" ? "Pick an option, or type" : canMessage ? (state.chatting ? "Tell Ziggy what went wrong" : "Pick above, or type") : "Ziggy is working";
   if (text.value === DEFAULT_REQUEST) text.value = "";
 
   $("phone-caption").textContent = {
@@ -442,6 +507,7 @@ const ENDPOINTS = {
   place_order: "POST /orders",
   award_stardust: "POST /members/{member}/stardust",
   issue_refund: "POST /refunds",
+  look_up_order: "GET /orders/{order}/support",
   place_comp: "POST /comps",
 };
 
@@ -530,7 +596,9 @@ function renderSupportAgent(view, c, s, m) {
   const acting = esc || res || phase === "resolving";
   const step = (status, label, detail, time = "") => ({ status, label, detail, time });
   const steps = [
-    step("completed", "Read the order", order ? `${order.orderNumber} · ${money(order.amount)} cr paid · passed in when the chat started` : ""),
+    step(s.record ? "completed" : "active", "Look up the order · store Activity", s.record
+      ? `${order?.orderNumber || ""} · ${money(s.record.paid)} cr paid · ${s.record.remediations.length ? `already done: ${s.record.remediations.map((r) => r.kind === "refund" ? `refund ${money(r.amount)} cr` : r.kind === "comp" ? `remade ${r.ref}` : `${r.points} Stardust`).join(", ")}` : "nothing done yet"} · ${money(s.record.refundable)} cr left to refund`
+      : "Before the agent starts: what was paid, and what support already did"),
     step(memberSaid ? "completed" : s.status === "Running" ? "waiting" : "skipped", "Hear what went wrong", memberSaid ? "" : "Waiting on the member", !memberSaid && s.idleUntil ? `closes in ${countdown(s.idleUntil, now)}` : ""),
     step(phase === "choosing" ? "waiting" : offered ? "completed" : "pending", "Offer choices · offer_choices", phase === "choosing" ? "Tool call waiting on the member's tap" : "", phase === "choosing" && s.idleUntil ? `closes in ${countdown(s.idleUntil, now)}` : ""),
     step(acting ? "completed" : "pending", "Café policy check · inside the tool", esc ? `Over the limit: ${esc.why}` : res ? "Within the limit: no approval needed" : "Plain code; the agent never sees it"),
@@ -566,7 +634,7 @@ function renderSupportAgent(view, c, s, m) {
   // The agent's tools run in the Workflow; the store calls they make are Activities.
   $("tools-title").textContent = "Tool calls · in the Workflow, then the store API";
   const chatStart = new Date(s.messages?.[0]?.at || 0);
-  const storeRows = (c?.proof?.rows || []).filter((r) => r.kind === "checkout" && ["issue_refund", "place_comp", "award_stardust"].includes(r.name) && new Date(r.at) >= chatStart);
+  const storeRows = (c?.proof?.rows || []).filter((r) => r.kind === "checkout" && ["look_up_order", "issue_refund", "place_comp", "award_stardust"].includes(r.name) && new Date(r.at) >= chatStart);
   const calls = [
     ...work.map((w) => ({ at: w.at, li: el("li", {},
       el("span", { class: "status-badge", "data-status": w.status, text: w.status === "completed" ? "Done" : "Failed" }),
@@ -577,7 +645,7 @@ function renderSupportAgent(view, c, s, m) {
       el("span", { class: "status-badge", "data-status": r.status === "failed" ? "retrying" : r.status, text: { completed: "Done", active: "Running", pending: "Queued", failed: "Failed" }[r.status] || r.status }),
       el("code", { text: ENDPOINTS[r.name] || r.name }),
       el("span", { class: "where", text: `Activity · Idempotency-Key · ${r.worker ? sandboxName(c, r.worker) : ""}` }),
-      res ? el("span", { class: "result", text: res.summary }) : null) })),
+      r.name === "look_up_order" ? el("span", { class: "result", text: "the order's support record, from any chat" }) : res ? el("span", { class: "result", text: res.summary }) : null) })),
   ].sort((a, b) => new Date(a.at) - new Date(b.at)).map((x) => x.li);
   if (phase === "choosing") calls.push(el("li", {}, el("span", { class: "status-badge", "data-status": "waiting", text: "Waiting" }), el("code", { text: "offer_choices" }), el("span", { class: "where", text: "tool · in the Workflow" }), el("span", { class: "result", text: "waiting for the member's tap" })));
   if (phase === "review" && esc) calls.push(el("li", {}, el("span", { class: "status-badge", "data-status": "waiting", text: "Waiting" }), el("code", { text: esc.tool }), el("span", { class: "where", text: "tool · in the Workflow" }), el("span", { class: "result", text: `${esc.what}: waiting for review` })));
@@ -657,14 +725,14 @@ function renderBackstage(view, o, m) {
   $("stat-charges-note").textContent = payment ? `${money(payment.amount)} cr · ${payment.paymentId}` : "none until the member pays";
   $("stat-orders").textContent = count("order");
   $("stat-orders-note").textContent = order ? `${order.orderNumber} · ${order.cafeName}` : o?.quote ? "cart only" : "no cart yet";
-  const refunds = entries.filter((e) => e.kind === "refund").map((e) => e.result);
-  const comps = entries.filter((e) => e.kind === "comp").map((e) => e.result);
-  const orderAward = entries.find((e) => e.kind === "stardust");
-  const gifts = entries.filter((e) => e.kind === "stardust" && e !== orderAward).map((e) => e.result);
-  $("stat-refunds").textContent = money(refunds.reduce((t, r) => t + Number(r.amount), 0));
-  $("stat-refunds-note").textContent = refunds.length ? refunds.map((r) => r.refundId).join(", ") : "no refunds";
-  $("stat-goodwill").textContent = comps.length + gifts.length;
-  $("stat-goodwill-note").textContent = [...comps.map((x) => `${x.orderNumber} · ${money(x.value)} cr, charged 0`), ...gifts.map((g) => `+${g.points} Stardust`)].join(" · ") || "nothing given";
+  // Support's record for the order, from every chat: the store keeps it.
+  const rems = view.record?.remediations || [];
+  const refunds = rems.filter((r) => r.kind === "refund");
+  const gifts = rems.filter((r) => r.kind !== "refund");
+  $("stat-refunds").textContent = money(view.record?.refunded ?? 0);
+  $("stat-refunds-note").textContent = refunds.length ? `${refunds.map((r) => r.ref).join(", ")} · ${money(view.record.refundable)} cr left` : "no refunds";
+  $("stat-goodwill").textContent = gifts.length;
+  $("stat-goodwill-note").textContent = gifts.map((g) => g.kind === "comp" ? `${g.ref} · ${money(g.amount)} cr, charged 0` : `+${g.points} Stardust`).join(" · ") || "nothing given";
   const sandboxCount = o?.proof?.workers?.length ?? 0;
   $("stat-invocations").textContent = sandboxCount;
   $("stat-invocations-note").textContent = sandboxCount ? "one per sandbox; each ended when idle" : "none yet";
@@ -735,6 +803,23 @@ document.addEventListener("DOMContentLoaded", () => {
     if (!btn || btn.disabled) return;
     if (btn.dataset.action === "help") startSupport();
     if (btn.dataset.action === "choose") choose(btn.dataset.option);
+    if (btn.dataset.action === "pick-item") {
+      const id = btn.dataset.item;
+      if (state.picks[id]) delete state.picks[id];
+      else state.picks[id] = "missing";
+      render();
+    }
+    if (btn.dataset.action === "pick-problem") {
+      state.picks[btn.dataset.item] = btn.dataset.problem;
+      render();
+    }
+    if (btn.dataset.action === "report-items") report("items");
+    if (btn.dataset.action === "report-scope") report(btn.dataset.scope);
+    if (btn.dataset.action === "chat") {
+      state.chatting = true;
+      render();
+      $("composer-text").focus();
+    }
   });
   $("new-order").addEventListener("click", () => {
     setOrder(null);

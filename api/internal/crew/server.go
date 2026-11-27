@@ -24,6 +24,7 @@ const (
 
 	supportWorkflowType = "SupportChatWorkflow"
 	signalChoose        = "choose"
+	signalReport        = "report"
 	signalReview        = "review"
 )
 
@@ -54,6 +55,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /api/orders/{id}/support", s.handleStartSupport)
 	mux.HandleFunc("POST /api/orders/{id}/support/{sid}/messages", s.handleSupportMessage)
 	mux.HandleFunc("POST /api/orders/{id}/support/{sid}/choose", s.handleSupportChoose)
+	mux.HandleFunc("POST /api/orders/{id}/support/{sid}/report", s.handleSupportReport)
 	mux.HandleFunc("POST /api/orders/{id}/support/{sid}/review", s.handleSupportReview)
 	return mux
 }
@@ -120,6 +122,13 @@ func (s *Server) handleView(w http.ResponseWriter, r *http.Request) {
 		var err error
 		if ledger, err = s.store.Ledger(gctx, wid); err != nil {
 			s.log.Warn("store ledger unavailable", "workflow_id", wid, "error", err)
+		}
+		return nil
+	})
+	g.Go(func() error {
+		// The order's support record, for the ledger; none until it's paid.
+		if rec, err := s.store.Record(gctx, wid); err == nil {
+			view.Record = rec
 		}
 		return nil
 	})
@@ -421,6 +430,37 @@ func (s *Server) handleSupportChoose(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.signalTo(w, r, s.supportID(r), signalChoose, map[string]any{"option_id": req.OptionID})
+}
+
+type reportRequest struct {
+	Scope string `json:"scope"`
+	Items []struct {
+		ItemID  string `json:"itemId"`
+		Problem string `json:"problem"`
+	} `json:"items"`
+}
+
+// handleSupportReport sends the member's picks from the "What went wrong?"
+// card: items marked missing or wrong, or the whole order, or the service.
+func (s *Server) handleSupportReport(w http.ResponseWriter, r *http.Request) {
+	var req reportRequest
+	if !s.supportSignal(w, r, &req) {
+		return
+	}
+	items := []map[string]any{}
+	for _, it := range req.Items {
+		if it.ItemID == "" || len(it.ItemID) > 60 || (it.Problem != "missing" && it.Problem != "wrong") {
+			s.problem(w, http.StatusBadRequest, "Invalid report", "Each item has an itemId and a problem of missing or wrong.")
+			return
+		}
+		items = append(items, map[string]any{"item_id": it.ItemID, "problem": it.Problem})
+	}
+	valid := (req.Scope == "items" && len(items) > 0 && len(items) <= 20) || ((req.Scope == "order" || req.Scope == "service") && len(items) == 0)
+	if !valid {
+		s.problem(w, http.StatusBadRequest, "Invalid report", "scope is items (with 1 to 20 items), order or service.")
+		return
+	}
+	s.signalTo(w, r, s.supportID(r), signalReport, map[string]any{"scope": req.Scope, "items": items})
 }
 
 type reviewRequest struct {

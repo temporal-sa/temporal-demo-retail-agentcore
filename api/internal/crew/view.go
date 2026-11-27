@@ -24,6 +24,9 @@ type View struct {
 	Order          *OrderView   `json:"order,omitempty"`
 	// Support is the support chat the page has open for this order.
 	Support *OrderView `json:"support,omitempty"`
+	// Record is the store's support record for the order: what was paid
+	// and every refund, comp and Stardust award, from any chat.
+	Record SupportRecord `json:"record,omitempty"`
 }
 
 // OrderView is one crew order Workflow, read without a Worker.
@@ -54,6 +57,8 @@ type OrderView struct {
 	Resolution any `json:"resolution,omitempty"`
 	Closed     any `json:"closed,omitempty"`
 	IdleUntil  any `json:"idleUntil,omitempty"`
+	// The order's support record as the chat last looked it up.
+	Record any `json:"record,omitempty"`
 }
 
 // Waiting describes a task Temporal has scheduled and no Worker has started.
@@ -71,12 +76,12 @@ type Proof struct {
 	ToolCalls  int        `json:"toolCalls"`
 	// Repeats counts calls that ran more than once (retries). Replacing a
 	// Worker adds none: the new one replays the history instead.
-	Repeats int      `json:"repeats"`
+	Repeats int `json:"repeats"`
 	// Tokens the model calls reported, read from each invoke_model result.
 	InputTokens  int      `json:"inputTokens"`
 	OutputTokens int      `json:"outputTokens"`
 	Workers      []string `json:"workers"`
-	Events  int      `json:"events"`
+	Events       int      `json:"events"`
 	// LastWorker is the Worker that most recently started or finished a
 	// task, at LastWorkerAt. A Worker can finish its work before its first
 	// heartbeat; this is how the view still knows it is there.
@@ -113,6 +118,7 @@ var activityKinds = map[string]string{
 	"charge_payment":    "checkout",
 	"place_order":       "checkout",
 	"award_stardust":    "checkout",
+	"look_up_order":     "checkout",
 	"issue_refund":      "checkout",
 	"place_comp":        "checkout",
 }
@@ -284,6 +290,7 @@ func (s *Server) orderView(orderID, wid string, d *describeResult, proof *Proof,
 		Resolution:  d.memo["resolution"],
 		Closed:      d.memo["closed"],
 		IdleUntil:   d.memo["idleUntil"],
+		Record:      d.memo["record"],
 		TemporalURL: s.temporalURL(wid),
 		Proof:       proof,
 		Ledger:      ledger,
