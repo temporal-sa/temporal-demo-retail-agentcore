@@ -327,9 +327,10 @@ type compRequest struct {
 	MemberID string `json:"memberId"`
 	Lines    []Line `json:"lines"`
 	// ForOrder is the order this one makes up for, and OrderKey its
-	// Idempotency-Key, where the comp is filed.
+	// Idempotency-Key, where the comp is filed. OrderKey is optional:
+	// support chats pinned to an older agent version don't send it.
 	ForOrder string `json:"forOrder"`
-	OrderKey string `json:"orderKey"`
+	OrderKey string `json:"orderKey,omitempty"`
 	Reason   string `json:"reason"`
 }
 
@@ -350,8 +351,8 @@ func (s *Server) handleComp(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if req.ForOrder == "" || !idempotencyKey.MatchString(req.OrderKey) || req.Reason == "" || len(req.Reason) > 300 {
-		problem(w, http.StatusUnprocessableEntity, "Invalid comp", "forOrder and orderKey are required and reason is 1 to 300 characters.")
+	if req.ForOrder == "" || (req.OrderKey != "" && !idempotencyKey.MatchString(req.OrderKey)) || req.Reason == "" || len(req.Reason) > 300 {
+		problem(w, http.StatusUnprocessableEntity, "Invalid comp", "forOrder is required, orderKey is the order's Idempotency-Key if sent, and reason is 1 to 300 characters.")
 		return
 	}
 	q, err := s.skin.PriceCart(QuoteRequest{CafeID: req.CafeID, MemberID: req.MemberID, Lines: req.Lines}, s.now())
@@ -370,7 +371,7 @@ func (s *Server) handleComp(w http.ResponseWriter, r *http.Request) {
 	for _, l := range req.Lines {
 		items = append(items, l.ItemID)
 	}
-	if !s.remediate(w, r, req.OrderKey, Remediation{Kind: "comp", Key: key, Amount: q.Subtotal, Items: items, Reason: req.Reason, Ref: comp.OrderNumber, At: s.now()}, 0) {
+	if req.OrderKey != "" && !s.remediate(w, r, req.OrderKey, Remediation{Kind: "comp", Key: key, Amount: q.Subtotal, Items: items, Reason: req.Reason, Ref: comp.OrderNumber, At: s.now()}, 0) {
 		return
 	}
 	s.write(w, r, "comp", key, req, comp)

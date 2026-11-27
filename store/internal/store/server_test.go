@@ -169,6 +169,11 @@ func TestCompIsPricedAndChargesNothing(t *testing.T) {
 	if resp.StatusCode != 201 || c["value"] != 6.40 || c["total"] != 0.0 || c["forOrder"] != "OG-4242" {
 		t.Fatalf("status %d, comp %v", resp.StatusCode, c)
 	}
+	// A chat pinned to an older agent sends no orderKey: still placed, just not filed.
+	old := map[string]any{"cafeId": "titan-ring", "memberId": "zora-vex", "lines": []Line{{ItemID: "ceres-veggie-wrap", Qty: 1}}, "forOrder": "OG-4242", "reason": "missing wrap"}
+	if resp, _ := call(t, srv, "POST", Prefix+"/comps", old, "Idempotency-Key", "crew-support-abc-07"); resp.StatusCode != 201 {
+		t.Fatalf("comp without orderKey: status %d", resp.StatusCode)
+	}
 	comp["lines"] = []Line{{ItemID: "nebula-latte", Qty: 1, Options: []string{"milk:oat"}}}
 	if resp, _ := call(t, srv, "POST", Prefix+"/comps", comp, "Idempotency-Key", "crew-support-abc-05"); resp.StatusCode != http.StatusUnprocessableEntity {
 		t.Fatalf("out of stock comp: status %d", resp.StatusCode)
