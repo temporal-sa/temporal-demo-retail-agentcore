@@ -14,6 +14,14 @@ It makes three problems visible ([docs/story.md](docs/story.md)):
    cart from the one the member approved.
 3. A retried or resumed checkout can charge the card twice.
 
+The support chat after pickup adds two more:
+
+4. An agent that can move money needs limits it can't talk its way past, and some calls need a
+   person. Here that's a deterministic flow inside the agent's tool: the agent doesn't decide to
+   escalate and doesn't know it happened.
+5. Support waits are long and uneven (the member, a support agent, a manager), and the agent is in
+   the middle of a tool call through them.
+
 ## Before you start
 
 - **Where:** the catalog card "Crew Orders Agent on AgentCore" on tmprl-demo.cloud opens
@@ -95,7 +103,49 @@ right after the promise and kept it."
 Proof: the Event History shows `Signal received · kitchen_ready`, and Model calls went up by one
 more. The Store ledger still shows one charge.
 
-### 6. Optional: ask for a change before paying
+### 6. Support: a missing wrap, put right on one tap
+
+The order's chat says "Chat closed". Tap **Need help with your order? Start a new chat**, type "My
+order was missing the wrap" and send.
+
+Ziggy asks how to fix it, with **Refund it**, **Make a fresh one at no charge** and **Something
+else** as buttons. Wait about a minute: the sandbox ends while the buttons wait. Tap **Refund it**.
+
+A new sandbox starts, the Tool calls card shows `issue_refund` and then `POST /refunds`, the Store
+ledger's Refunded tile shows the amount, and Ziggy closes the chat.
+
+Say: "The buttons are a tool call, offer_choices, that waits for the tap. The sandbox ended in the
+middle of it, and the tap brought it back into the same call. The refund was within the café's
+limits, so the tool just did it."
+
+### 7. Support: a full refund waits for a person, and the agent never knows (problems 4 and 5)
+
+Start another chat: "My entire order was terrible". Ziggy asks how to resolve it. Tap **Full
+refund**.
+
+Ziggy says "I've escalated this to a support agent, who will review it now." The Support desk card
+shows the request with **Approve as support** and **Deny**, and a countdown; the step list shows
+"Human review · inside the tool"; the Tool calls card shows `issue_refund` waiting. Wait a minute
+for **No sandbox running**.
+
+Say: "Ziggy didn't decide to escalate, and doesn't know it did. It called issue_refund. That tool is
+plain code in the Workflow: it checked the café's policy, saw a 48 cr refund is over the limit, and
+is now waiting for a person. Ziggy's tool call just hasn't come back yet. That's a decision we
+don't want a model making, and here it can't: no prompt can talk its way past an if statement. And
+the wait costs nothing: there's no sandbox."
+
+Then either click **Approve as support**, or don't, and let the timers show:
+
+- After 90 seconds the Event History shows "Timer fired", Ziggy says the request went to a manager,
+  and the card says **Manager review**.
+- After 90 more it shows "Timer fired" again and the tool approves the refund itself.
+
+Either way a new sandbox starts, the tool carries on from where it waited, calls `POST /refunds`
+once, and returns "Done" to Ziggy, which tells the member.
+
+Proof: Refunded 48.24 on the Store ledger, once; "repeated after resume" is 0.
+
+### 8. Optional: ask for a change before paying
 
 On a new order, instead of paying, type "add two more donuts" and send. Locally the stub model says
 it can only build the scripted order; with Bedrock, Ziggy reprices the cart and Pay uses the new
@@ -184,6 +234,47 @@ The one gap left is a sandbox lost after the store took the payment and before t
 Temporal; the retry then sends the same Idempotency-Key (the Workflow ID), and the store's
 conditional write answers with the first result.
 
+### Escalate inside the tool, where the agent can't see it
+
+**When:** beat 7, "who decided this needed a human?"
+
+**Where:** the tool at [`agent/crew/support.py:256-264`](agent/crew/support.py#L256-L264), the
+policy at [`103-135`](agent/crew/support.py#L103-L135), the escalation at
+[`311-346`](agent/crew/support.py#L311-L346) (`code -g agent/crew/support.py:311`)
+
+```python
+async def _act(self, kind, reason, *, amount=0.0, item_ids=None, points=0) -> str:
+    status, why, value = check(kind, order, amount=amount, item_ids=item_ids, points=points)
+    if status == "refused":
+        return f"Not possible: {why}."
+    if status == "approval":
+        approved, decided_by = await self._review(TOOL_NAMES[kind], what, why, reason)
+        if not approved:
+            return "The café declined this request."
+    result = await self._carry_out(kind, reason, amount=value, item_ids=item_ids or [], points=points)
+    return f"Done: {result['summary']}."
+
+# _review: a support agent, then a manager, then the timer
+for tier, seconds, line in tiers:
+    self._say("ziggy", line)  # fixed text, not the model's
+    try:
+        await workflow.wait_condition(lambda: self._decision is not None, timeout=timedelta(seconds=seconds))
+    except asyncio.TimeoutError:
+        continue
+    return self._decision.approve, tier
+return True, "timer"
+```
+
+**What to understand:** this is the point of the second act. The escalation is a deterministic flow
+in code, not something the agent decides, and the agent isn't aware of it. Nothing in the system
+prompt or the tool descriptions mentions approval; the model sees a tool that returns "Done",
+"declined" or "Not possible". The plugin lets a Strands tool be ordinary Workflow code, so the tool
+itself can check a policy, wait on a Signal (`review`) or a timer with `wait_condition`, and call an
+Activity, all durably. While it waits the Worker drains and AgentCore ends the session; the next
+Signal or timer starts a new Worker, which replays the agent back into the same tool call. The
+"I've escalated this" line is posted by the Workflow, in Ziggy's voice. Use this shape for any
+action where the rule must hold whatever the model says: refunds, credits, account changes.
+
 ### Show state without a running Worker
 
 **When:** "How does the screen know what's happening if nothing is running?"
@@ -204,6 +295,8 @@ Nothing keeps running. A finished order uses no compute, and an unpaid one close
 minutes (its timer is the only thing it costs while it waits). AgentCore ends each idle session
 after 60 seconds. Ledger rows expire after 7 days.
 
+A support chat closes itself once resolved, or 3 minutes after the member last said anything.
+
 One order costs 19 Actions on Temporal Cloud: the start, 16 Activities (7 model calls, 5 tool calls,
 3 checkout steps and the plugin's one model-config read), the payment timer and the Signal, counted
 from a real run's Event History with the stub model. Bedrock may make a different number of model
@@ -216,6 +309,7 @@ calls. The memo updates and the screen's reads cost none.
 | "Starting a sandbox" stays up for more than 30 s | Temporal Cloud can't invoke the runtime, or the Worker fails at start | In the Temporal UI, open the Worker Deployment and check the version is current; check the runtime's log group `/aws/bedrock-agentcore/runtimes/<runtime id>-<endpoint>` |
 | A model step fails with `AccessDeniedException` | Bedrock model access isn't enabled in the AWS account | An AWS admin enables the model once per account (docs/catalog.md, 8) |
 | Tool calls fail and Ziggy says it couldn't read the store | The agent can't reach the store's public route, or the token differs | Open `https://<demo host>/store/v1/cafes`: 401 means the route works. Check `STORE_API_URL` in the DemoProject names this host |
+| Approve does nothing, or the chat stays on "Ziggy is working" | The review timer already moved the request on, or a new sandbox is still starting | Watch the Support desk card's tier and countdown; a decision applies to whoever holds the request now |
 | Pay does nothing | The cart changed after the phone showed it, or the order closed after 30 minutes | Start a new order |
 | The Tool calls card says "stub model, offline" on the hosted demo | `AGENT_MODEL=stub` in the component's env | Set `AGENT_MODEL: bedrock` in the DemoProject |
 

@@ -3,7 +3,9 @@
 # cart wait for the member with no Worker running, replace the agent's process,
 # pay, and see a new Worker finish the order without repeating a model or tool
 # call, with one charge in the store's ledger. Then the kitchen marks it ready
-# and another new Worker tells the member.
+# and another new Worker tells the member. Then two support chats: a refund
+# the policy allows on the tap, and a full refund that waits for a person
+# (E2E_TIMERS=1 lets the review timers decide it instead, about 3 minutes).
 set -eu
 API=${API:-http://localhost:8080}
 JAR=$(mktemp); OTHER=$(mktemp); trap 'rm -f "$JAR" "$OTHER"' EXIT
@@ -76,4 +78,62 @@ assert ledger['replays'] == 0, ledger
 assert o['placed']['amount'] == 48.24, o['placed']
 print(f\"ok: {p['modelCalls']} model calls and {p['toolCalls']} tool calls, each once; one charge of 48.24, order {o['placed']['orderNumber']}\")
 " "$before"
+
+# Support: a missing wrap is refunded on the member's tap; a full refund
+# waits, inside the agent's issue_refund tool, for a person.
+SID=""
+sview() { curl -sf -b "$JAR" -c "$JAR" "$API/api/view?order=$ID&support=$SID"; }
+swait() { # swait <python expr on v> <seconds> <what>
+  i=0
+  until [ "$(sview | field "$1")" = True ]; do
+    i=$((i + 1)); [ "$i" -le "$2" ] || { echo "FAIL: $3"; sview; exit 1; }
+    sleep 1
+  done
+  echo "ok: $3 (${i}s)"
+}
+support() { # support <opening message>
+  SID=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
+  code=$(post "/api/orders/$ID/support" "{\"id\":\"$SID\"}")
+  [ "$code" = 201 ] || { echo "FAIL: support start returned $code"; exit 1; }
+  code=$(post "/api/orders/$ID/support/$SID/messages" "{\"text\":\"$1\"}")
+  [ "$code" = 202 ] || { echo "FAIL: support message returned $code"; exit 1; }
+  swait "v['support']['phase'] == 'choosing' and bool(v['support']['offer'])" 90 "Ziggy offered choices for \"$1\""
+  first=$(sview | field "v['support']['offer'][0]['id']")
+  code=$(post "/api/orders/$ID/support/$SID/choose" "{\"optionId\":\"$first\"}")
+  [ "$code" = 202 ] || { echo "FAIL: choose returned $code"; exit 1; }
+}
+
+support "My order was missing the wrap"
+swait "v['support']['status'] == 'Completed'" 90 "the refund ran on the tap and the chat closed"
+sview | python3 -c "
+import json, sys
+s = json.load(sys.stdin)['support']
+assert s['resolution']['kind'] == 'refund' and s['resolution']['decidedBy'] == 'policy', s['resolution']
+assert not s.get('escalation'), s['escalation']
+assert [e['kind'] for e in s['ledger']['entries']] == ['refund'], s['ledger']
+print(f\"ok: {s['resolution']['summary']}, no review needed\")
+"
+
+support "My entire order was terrible"
+swait "v['support']['phase'] == 'review' and v['support']['escalation']['tier'] == 'support'" 90 "the full refund is waiting on a support agent, inside the tool"
+[ "$(sview | field "len((v['support'].get('ledger') or {}).get('entries') or [])")" = 0 ] || { echo "FAIL: refunded before review"; exit 1; }
+swait "not v['worker']['running']" 90 "the sandbox ended while the tool call waits"
+if [ "${E2E_TIMERS:-0}" = 1 ]; then
+  swait "v['support']['escalation']['tier'] == 'manager'" 120 "nobody reviewed it, so the timer moved it to a manager"
+  swait "v['support']['status'] == 'Completed'" 150 "nobody reviewed it, so the timer approved it"
+  [ "$(sview | field "v['support']['escalation']['decidedBy']")" = timer ] || { echo "FAIL: not approved by the timer"; exit 1; }
+else
+  code=$(post "/api/orders/$ID/support/$SID/review" '{"approve":true}')
+  [ "$code" = 202 ] || { echo "FAIL: review returned $code"; exit 1; }
+  echo "ok: a support agent approved it with no Worker running"
+  swait "v['support']['status'] == 'Completed'" 90 "a new sandbox carried on inside the tool and refunded"
+fi
+sview | python3 -c "
+import json, sys
+s = json.load(sys.stdin)['support']
+refunds = [e for e in s['ledger']['entries'] if e['kind'] == 'refund']
+assert len(refunds) == 1 and refunds[0]['result']['amount'] == 48.24 and s['ledger']['replays'] == 0, s['ledger']
+assert s['proof']['repeats'] == 0, s['proof']
+print('ok: one refund of 48.24, nothing repeated')
+"
 echo PASS

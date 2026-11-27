@@ -13,8 +13,9 @@ been through the platform's `validate-projects` yet.
    per order too. The Worker status is shared: every viewer sees the same Worker, which is the
    point of the demo.
 3. **Task-queue environment variable, base queue, and how Workflow code inherits the queue.**
-   `TEMPORAL_TASK_QUEUE`, base `retail-agentcore`, set as a literal on `api` and `agent`. The
-   Workflow starts no child Workflows and uses no other queue.
+   `TEMPORAL_TASK_QUEUE`, base `retail-agentcore`, set as a literal on `api` and `agent`. Both
+   Workflows (`CrewOrderWorkflow`, and `SupportChatWorkflow` started by the API for a finished
+   order, ID `<order's Workflow ID>-support-<chat>`) run on it; neither starts child Workflows.
 4. **How Workflow IDs and external records stay distinct across crashable workspaces that share a
    Namespace.** There are no crashable workspaces: the platform never makes a project with a
    serverless component crashable, and the draft says `crashable.enabled: false`. Concurrent
