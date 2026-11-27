@@ -52,6 +52,7 @@ func (s *Server) routes() http.Handler {
 	api.HandleFunc("POST "+Prefix+"/refunds", s.handleRefund)
 	api.HandleFunc("POST "+Prefix+"/comps", s.handleComp)
 	api.HandleFunc("GET "+Prefix+"/ledger/{key}", s.handleLedger)
+	api.HandleFunc("GET "+Prefix+"/orders/{key}/support", s.handleSupportRecord)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok\n")) })
@@ -224,6 +225,10 @@ func (s *Server) handlePlaceOrder(w http.ResponseWriter, r *http.Request) {
 type stardustRequest struct {
 	Points      int    `json:"points"`
 	OrderNumber string `json:"orderNumber"`
+	// OrderKey and Reason are set when support gives the Stardust, to
+	// file it in the order's case.
+	OrderKey string `json:"orderKey,omitempty"`
+	Reason   string `json:"reason,omitempty"`
 }
 
 type Award struct {
@@ -248,15 +253,21 @@ func (s *Server) handleStardust(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusUnprocessableEntity, "Invalid award", "points is 1 to 100000 and orderNumber is required.")
 		return
 	}
+	if req.OrderKey != "" {
+		if !s.remediate(w, r, req.OrderKey, Remediation{Kind: "stardust", Key: key, Points: req.Points, Items: []string{}, Reason: req.Reason, At: s.now()}, 0) {
+			return
+		}
+	}
 	s.write(w, r, "stardust", key, req, Award{MemberID: m.ID, Points: req.Points, OrderNumber: req.OrderNumber, Balance: m.Stardust + req.Points})
 }
 
 type refundRequest struct {
 	// OrderKey is the Idempotency-Key the order's payment was taken with.
-	OrderKey  string `json:"orderKey"`
-	PaymentID string `json:"paymentId"`
-	Amount    Money  `json:"amount"`
-	Reason    string `json:"reason"`
+	OrderKey  string   `json:"orderKey"`
+	PaymentID string   `json:"paymentId"`
+	Amount    Money    `json:"amount"`
+	Items     []string `json:"items"`
+	Reason    string   `json:"reason"`
 }
 
 type Refund struct {
@@ -266,9 +277,10 @@ type Refund struct {
 	Reason    string `json:"reason"`
 }
 
-// handleRefund returns money to the card a payment was taken from, never
-// more than that payment. The limits on what needs approval are the
-// support Workflow's; this is the store's own floor.
+// handleRefund returns money to the card a payment was taken from. All of
+// an order's refunds together, from any chat, never pass that payment. The
+// limits on what needs approval are the support Workflow's; this is the
+// store's own floor.
 func (s *Server) handleRefund(w http.ResponseWriter, r *http.Request) {
 	var req refundRequest
 	key, ok := s.idempotent(w, r, &req)
@@ -303,15 +315,21 @@ func (s *Server) handleRefund(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusUnprocessableEntity, "Invalid amount", fmt.Sprintf("A refund is 0.01 to %s cr, the amount paid.", paid.Amount))
 		return
 	}
-	s.write(w, r, "refund", key, req, Refund{RefundID: "rf_" + digest(key)[:12], PaymentID: req.PaymentID, Amount: req.Amount, Reason: req.Reason})
+	refund := Refund{RefundID: "rf_" + digest(key)[:12], PaymentID: req.PaymentID, Amount: req.Amount, Reason: req.Reason}
+	if !s.remediate(w, r, req.OrderKey, Remediation{Kind: "refund", Key: key, Amount: req.Amount, Items: nonNil(req.Items), Reason: req.Reason, Ref: refund.RefundID, At: s.now()}, paid.Amount) {
+		return
+	}
+	s.write(w, r, "refund", key, req, refund)
 }
 
 type compRequest struct {
 	CafeID   string `json:"cafeId"`
 	MemberID string `json:"memberId"`
 	Lines    []Line `json:"lines"`
-	// ForOrder is the order this one makes up for.
+	// ForOrder is the order this one makes up for, and OrderKey its
+	// Idempotency-Key, where the comp is filed.
 	ForOrder string `json:"forOrder"`
+	OrderKey string `json:"orderKey"`
 	Reason   string `json:"reason"`
 }
 
@@ -332,8 +350,8 @@ func (s *Server) handleComp(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if req.ForOrder == "" || req.Reason == "" || len(req.Reason) > 300 {
-		problem(w, http.StatusUnprocessableEntity, "Invalid comp", "forOrder is required and reason is 1 to 300 characters.")
+	if req.ForOrder == "" || !idempotencyKey.MatchString(req.OrderKey) || req.Reason == "" || len(req.Reason) > 300 {
+		problem(w, http.StatusUnprocessableEntity, "Invalid comp", "forOrder and orderKey are required and reason is 1 to 300 characters.")
 		return
 	}
 	q, err := s.skin.PriceCart(QuoteRequest{CafeID: req.CafeID, MemberID: req.MemberID, Lines: req.Lines}, s.now())
@@ -347,11 +365,91 @@ func (s *Server) handleComp(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusInternalServerError, "Comp failed")
 		return
 	}
-	s.write(w, r, "comp", key, req, CompOrder{OrderNumber: s.orderNumber(key), CafeName: q.CafeName, ItemCount: q.ItemCount, Value: q.Subtotal, ReadyAt: q.ReadyAt, ForOrder: req.ForOrder})
+	comp := CompOrder{OrderNumber: s.orderNumber(key), CafeName: q.CafeName, ItemCount: q.ItemCount, Value: q.Subtotal, ReadyAt: q.ReadyAt, ForOrder: req.ForOrder}
+	items := []string{}
+	for _, l := range req.Lines {
+		items = append(items, l.ItemID)
+	}
+	if !s.remediate(w, r, req.OrderKey, Remediation{Kind: "comp", Key: key, Amount: q.Subtotal, Items: items, Reason: req.Reason, Ref: comp.OrderNumber, At: s.now()}, 0) {
+		return
+	}
+	s.write(w, r, "comp", key, req, comp)
 }
 
 func (s *Server) orderNumber(key string) string {
 	return fmt.Sprintf("%s-%04d", s.skin.Brand.OrderPrefix, 2200+binary.BigEndian.Uint32(digestBytes(key))%7800)
+}
+
+// remediate files a remediation in the order's case before the write that
+// answers the caller. A retry finds it filed and goes on to the write.
+func (s *Server) remediate(w http.ResponseWriter, r *http.Request, orderKey string, rem Remediation, refundCap Money) bool {
+	err := s.ledger.Remediate(r.Context(), orderKey, rem, refundCap)
+	if errors.Is(err, ErrOverRefund) {
+		c, _ := s.ledger.Case(r.Context(), orderKey)
+		problem(w, http.StatusUnprocessableEntity, "Refund too large", fmt.Sprintf("%s cr of the %s cr paid is already refunded.", c.Refunded, refundCap))
+		return false
+	}
+	if err != nil {
+		s.log.Error("case write failed", "key", orderKey, "error", err)
+		problem(w, http.StatusServiceUnavailable, "Ledger unavailable", "Retry with the same Idempotency-Key.")
+		return false
+	}
+	return true
+}
+
+func nonNil(items []string) []string {
+	if items == nil {
+		return []string{}
+	}
+	return items
+}
+
+// SupportRecord is what support needs to know about an order: what was paid
+// and everything support has done for it so far.
+type SupportRecord struct {
+	OrderKey     string        `json:"orderKey"`
+	OrderNumber  string        `json:"orderNumber"`
+	PaymentID    string        `json:"paymentId"`
+	Paid         Money         `json:"paid"`
+	Refunded     Money         `json:"refunded"`
+	Refundable   Money         `json:"refundable"`
+	Remediations []Remediation `json:"remediations"`
+}
+
+func (s *Server) handleSupportRecord(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
+	if !idempotencyKey.MatchString(key) {
+		problem(w, http.StatusBadRequest, "Invalid key")
+		return
+	}
+	entries, err := s.ledger.List(r.Context(), key)
+	if err == nil {
+		var c Case
+		if c, err = s.ledger.Case(r.Context(), key); err == nil {
+			rec := SupportRecord{OrderKey: key, Refunded: c.Refunded, Remediations: c.Remediations}
+			for _, e := range entries {
+				switch e.Kind {
+				case "payment":
+					var p Payment
+					_ = json.Unmarshal(e.Result, &p)
+					rec.PaymentID, rec.Paid = p.PaymentID, p.Amount
+				case "order":
+					var o Order
+					_ = json.Unmarshal(e.Result, &o)
+					rec.OrderNumber = o.OrderNumber
+				}
+			}
+			if rec.PaymentID == "" {
+				problem(w, http.StatusNotFound, "No such order", "Nothing was paid with this key.")
+				return
+			}
+			rec.Refundable = max(rec.Paid-rec.Refunded, 0)
+			writeJSON(w, http.StatusOK, rec)
+			return
+		}
+	}
+	s.log.Error("ledger read failed", "key", key, "error", err)
+	problem(w, http.StatusServiceUnavailable, "Ledger unavailable")
 }
 
 func (s *Server) handleLedger(w http.ResponseWriter, r *http.Request) {

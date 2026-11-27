@@ -31,8 +31,39 @@ type Entry struct {
 // Kinds of write: an order makes the first three, a support chat the others.
 var kinds = []string{"payment", "order", "stardust", "refund", "comp"}
 
+// Remediation is one thing support did for an order: a refund, a comp or
+// Stardust, filed by the support chat's Idempotency-Key.
+type Remediation struct {
+	Kind   string    `json:"kind"`
+	Key    string    `json:"key"`
+	Amount Money     `json:"amount"`
+	Items  []string  `json:"items"`
+	Points int       `json:"points,omitempty"`
+	Reason string    `json:"reason"`
+	Ref    string    `json:"ref"` // the refund ID or the comp's order number
+	At     time.Time `json:"at"`
+}
+
+// Case is an order's support record: everything support has done for it,
+// whichever chat did it.
+type Case struct {
+	Refunded     Money         `json:"refunded"`
+	Remediations []Remediation `json:"remediations"`
+}
+
+// ErrOverRefund means a refund would take the order's refunds past what
+// was paid.
+var ErrOverRefund = errors.New("refunds would exceed the amount paid")
+
 // Ledger keeps the store's writes. The store process itself holds no state.
 type Ledger interface {
+	// Remediate adds r to the order's case, once per r.Key. A refund is
+	// added only while the case's refunds stay within refundCap; the check
+	// and the write are one atomic step, so two chats can't both refund
+	// the last of the payment.
+	Remediate(ctx context.Context, orderKey string, r Remediation, refundCap Money) error
+	// Case returns the order's support record, empty if support did nothing.
+	Case(ctx context.Context, orderKey string) (Case, error)
 	// Record stores e unless an entry of its kind and key exists. It returns
 	// the stored entry and whether this call created it.
 	Record(ctx context.Context, e Entry) (Entry, bool, error)
@@ -112,6 +143,84 @@ func (l *DynamoLedger) List(ctx context.Context, key string) ([]Entry, error) {
 	return inKindOrder(byKind), nil
 }
 
+func casePK(orderKey string) string { return "case#" + orderKey }
+
+func (l *DynamoLedger) Remediate(ctx context.Context, orderKey string, r Remediation, refundCap Money) error {
+	raw, err := json.Marshal(r)
+	if err != nil {
+		return err
+	}
+	amount := Money(0)
+	if r.Kind == "refund" {
+		amount = r.Amount
+	}
+	_, err = l.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: &l.table,
+		Key:       map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: casePK(orderKey)}},
+		UpdateExpression: aws.String("SET refunded = if_not_exists(refunded, :zero) + :amount, " +
+			"remediations = list_append(if_not_exists(remediations, :none), :this), expiresAt = :expires ADD remediationKeys :key"),
+		// Once per chat, and never past the payment.
+		ConditionExpression: aws.String("(attribute_not_exists(remediationKeys) OR NOT contains(remediationKeys, :keyValue)) AND " +
+			"(attribute_not_exists(refunded) OR refunded <= :room)"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":zero":     &types.AttributeValueMemberN{Value: "0"},
+			":amount":   &types.AttributeValueMemberN{Value: strconv.FormatInt(int64(amount), 10)},
+			":room":     &types.AttributeValueMemberN{Value: strconv.FormatInt(int64(refundCap-amount), 10)},
+			":none":     &types.AttributeValueMemberL{Value: []types.AttributeValue{}},
+			":this":     &types.AttributeValueMemberL{Value: []types.AttributeValue{&types.AttributeValueMemberS{Value: string(raw)}}},
+			":key":      &types.AttributeValueMemberSS{Value: []string{r.Key}},
+			":keyValue": &types.AttributeValueMemberS{Value: r.Key},
+			":expires":  &types.AttributeValueMemberN{Value: strconv.FormatInt(r.At.Add(entryTTL).Unix(), 10)},
+		},
+	})
+	var failed *types.ConditionalCheckFailedException
+	if !errors.As(err, &failed) {
+		return err
+	}
+	// Either this chat's remediation is already filed (a retry), or the
+	// refund doesn't fit.
+	c, err := l.Case(ctx, orderKey)
+	if err != nil {
+		return err
+	}
+	for _, done := range c.Remediations {
+		if done.Key == r.Key {
+			return nil
+		}
+	}
+	return ErrOverRefund
+}
+
+func (l *DynamoLedger) Case(ctx context.Context, orderKey string) (Case, error) {
+	out, err := l.db.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName:      &l.table,
+		Key:            map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: casePK(orderKey)}},
+		ConsistentRead: aws.Bool(true),
+	})
+	if err != nil {
+		return Case{}, err
+	}
+	c := Case{Remediations: []Remediation{}}
+	if v, ok := out.Item["refunded"].(*types.AttributeValueMemberN); ok {
+		n, _ := strconv.ParseInt(v.Value, 10, 64)
+		c.Refunded = Money(n)
+	}
+	if list, ok := out.Item["remediations"].(*types.AttributeValueMemberL); ok {
+		for _, v := range list.Value {
+			s, ok := v.(*types.AttributeValueMemberS)
+			if !ok {
+				continue
+			}
+			var r Remediation
+			if err := json.Unmarshal([]byte(s.Value), &r); err != nil {
+				return Case{}, err
+			}
+			c.Remediations = append(c.Remediations, r)
+		}
+	}
+	return c, nil
+}
+
 func decodeEntry(item map[string]types.AttributeValue) (Entry, error) {
 	str := func(name string) string {
 		if v, ok := item[name].(*types.AttributeValueMemberS); ok {
@@ -164,9 +273,42 @@ func (l *DynamoLedger) CreateTable(ctx context.Context) error {
 type MemoryLedger struct {
 	mu      sync.Mutex
 	entries map[string]Entry
+	cases   map[string]Case
 }
 
-func NewMemoryLedger() *MemoryLedger { return &MemoryLedger{entries: map[string]Entry{}} }
+func NewMemoryLedger() *MemoryLedger {
+	return &MemoryLedger{entries: map[string]Entry{}, cases: map[string]Case{}}
+}
+
+func (l *MemoryLedger) Remediate(_ context.Context, orderKey string, r Remediation, refundCap Money) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	c := l.cases[orderKey]
+	for _, done := range c.Remediations {
+		if done.Key == r.Key {
+			return nil
+		}
+	}
+	if r.Kind == "refund" {
+		if c.Refunded+r.Amount > refundCap {
+			return ErrOverRefund
+		}
+		c.Refunded += r.Amount
+	}
+	c.Remediations = append(append([]Remediation{}, c.Remediations...), r)
+	l.cases[orderKey] = c
+	return nil
+}
+
+func (l *MemoryLedger) Case(_ context.Context, orderKey string) (Case, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	c := l.cases[orderKey]
+	if c.Remediations == nil {
+		c.Remediations = []Remediation{}
+	}
+	return c, nil
+}
 
 func (l *MemoryLedger) Record(_ context.Context, e Entry) (Entry, bool, error) {
 	l.mu.Lock()

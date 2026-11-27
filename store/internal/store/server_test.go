@@ -164,7 +164,7 @@ func TestRefundIsCappedAtThePaymentAndTakenOnce(t *testing.T) {
 
 func TestCompIsPricedAndChargesNothing(t *testing.T) {
 	srv, _ := newTestServer(t)
-	comp := map[string]any{"cafeId": "titan-ring", "memberId": "zora-vex", "lines": []Line{{ItemID: "ceres-veggie-wrap", Qty: 1, Note: "Mo"}}, "forOrder": "OG-4242", "reason": "missing wrap"}
+	comp := map[string]any{"cafeId": "titan-ring", "memberId": "zora-vex", "lines": []Line{{ItemID: "ceres-veggie-wrap", Qty: 1, Note: "Mo"}}, "forOrder": "OG-4242", "orderKey": "crew-order-abc-04", "reason": "missing wrap"}
 	resp, c := call(t, srv, "POST", Prefix+"/comps", comp, "Idempotency-Key", "crew-support-abc-04")
 	if resp.StatusCode != 201 || c["value"] != 6.40 || c["total"] != 0.0 || c["forOrder"] != "OG-4242" {
 		t.Fatalf("status %d, comp %v", resp.StatusCode, c)
@@ -172,5 +172,33 @@ func TestCompIsPricedAndChargesNothing(t *testing.T) {
 	comp["lines"] = []Line{{ItemID: "nebula-latte", Qty: 1, Options: []string{"milk:oat"}}}
 	if resp, _ := call(t, srv, "POST", Prefix+"/comps", comp, "Idempotency-Key", "crew-support-abc-05"); resp.StatusCode != http.StatusUnprocessableEntity {
 		t.Fatalf("out of stock comp: status %d", resp.StatusCode)
+	}
+}
+
+func TestAnOrdersRefundsFromEveryChatStayWithinThePayment(t *testing.T) {
+	srv, _ := newTestServer(t)
+	_, q := call(t, srv, "POST", Prefix+"/quotes", crewCart)
+	_, paid := call(t, srv, "POST", Prefix+"/payments", map[string]any{"quoteId": q["quoteId"]}, "Idempotency-Key", "crew-order-abc-06")
+	refund := func(chat string, amount float64) *http.Response {
+		resp, _ := call(t, srv, "POST", Prefix+"/refunds", map[string]any{"orderKey": "crew-order-abc-06", "paymentId": paid["paymentId"], "amount": amount, "items": []string{"ceres-veggie-wrap"}, "reason": "missing wrap"}, "Idempotency-Key", chat)
+		return resp
+	}
+	if resp := refund("crew-order-abc-06-support-1", 6.40); resp.StatusCode != 201 {
+		t.Fatalf("first refund: status %d", resp.StatusCode)
+	}
+	total := paid["amount"].(float64)
+	if resp := refund("crew-order-abc-06-support-2", total); resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("the full payment again from a second chat: status %d", resp.StatusCode)
+	}
+	if resp := refund("crew-order-abc-06-support-1", 6.40); resp.StatusCode != 200 {
+		t.Fatalf("a retry of the first: status %d", resp.StatusCode)
+	}
+	_, rec := call(t, srv, "GET", Prefix+"/orders/crew-order-abc-06/support", nil)
+	rems := rec["remediations"].([]any)
+	if rec["refunded"] != 6.40 || len(rems) != 1 || rems[0].(map[string]any)["items"].([]any)[0] != "ceres-veggie-wrap" {
+		t.Fatalf("record %v", rec)
+	}
+	if rec["refundable"].(float64) != float64(int(total*100)-640)/100 {
+		t.Fatalf("refundable %v of %v", rec["refundable"], total)
 	}
 }
