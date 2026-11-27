@@ -140,7 +140,9 @@ async function markReady() {
 async function startSupport() {
   const id = newId();
   setSupport(id);
-  state.pendingSupport = { id, status: "Running", phase: "listening", messages: [], work: [], proof: { rows: [], workers: [] } };
+  // Show the member's opening line and Ziggy typing until the chat exists.
+  const opener = { from: "member", text: `I need some help with my order ${state.view?.order?.placed?.orderNumber || ""}.`, at: new Date().toISOString() };
+  state.pendingSupport = { id, status: "Running", phase: "thinking", messages: [opener], work: [], proof: { rows: [], workers: [] } };
   if (state.view) state.view = { ...state.view, support: null };
   render();
   try {
@@ -520,7 +522,8 @@ function renderSupportAgent(view, c, s, m) {
   const res = s.resolution;
   const phase = s.phase;
   const order = c?.placed;
-  const memberSaid = (s.messages || []).some((msg) => msg.from === "member");
+  // After the app's opening line and Ziggy's greeting.
+  const memberSaid = (s.messages || []).slice(2).some((msg) => msg.from === "member");
   const offered = work.some((w) => w.tool === "offer_choices");
   const acting = esc || res || phase === "resolving";
   const step = (status, label, detail, time = "") => ({ status, label, detail, time });

@@ -85,7 +85,10 @@ func TestSupportInputWaitsForAPaidOrder(t *testing.T) {
 	if !ok || order["payment_id"] != "ch_1" || order["amount_paid"] != 48.24 || len(order["lines"].([]any)) != 1 {
 		t.Fatalf("input %v", in)
 	}
-	if in["greeting"] != "Hi Zora! I'm Ziggy, from support. What went wrong with order OG-4242?" {
+	if in["opener"] != "I need some help with my order OG-4242." {
+		t.Fatalf("opener %q", in["opener"])
+	}
+	if in["greeting"] != "Hi Zora! I'm Ziggy, from support. Sorry it wasn't right. What went wrong?" {
 		t.Fatalf("greeting %q", in["greeting"])
 	}
 }

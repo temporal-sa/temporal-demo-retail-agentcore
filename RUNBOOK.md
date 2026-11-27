@@ -105,8 +105,9 @@ more. The Store ledger still shows one charge.
 
 ### 6. Support: a missing wrap, put right on one tap
 
-The order's chat says "Chat closed". Tap **Need help with your order? Start a new chat**, type "My
-order was missing the wrap" and send.
+The order's chat says "Chat closed". Tap **Need help with your order? Start a new chat**. The phone
+sends "I need some help with my order OG-…" and Ziggy asks what went wrong. Type "My order was
+missing the wrap" and send.
 
 Ziggy asks how to fix it, with **Refund it**, **Make a fresh one at no charge** and **Something
 else** as buttons. Wait about a minute: the sandbox ends while the buttons wait. Tap **Refund it**.

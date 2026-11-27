@@ -78,6 +78,9 @@ class OrderContext:
 class SupportRequest:
     order: OrderContext
     greeting: str
+    # What the member's first message says when they open the chat from
+    # the app, before Ziggy's greeting.
+    opener: str = ""
     # Short enough to show on the hosted copy, and each longer than
     # AgentCore's 60 s idle timeout, so every wait ends the sandbox.
     idle_timeout_seconds: int = 180
@@ -171,7 +174,10 @@ class SupportChatWorkflow:
         self._resolved = False
         self._memo: dict[str, Any] = {
             "phase": "listening",
-            "messages": [{"from": "ziggy", "text": req.greeting, "at": workflow.info().start_time.isoformat()}],
+            "messages": [
+                *([{"from": "member", "text": req.opener, "at": workflow.info().start_time.isoformat()}] if req.opener else []),
+                {"from": "ziggy", "text": req.greeting, "at": workflow.info().start_time.isoformat()},
+            ],
             "work": [],
             "offer": None,
             "escalation": None,

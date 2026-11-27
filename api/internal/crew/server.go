@@ -129,12 +129,22 @@ func (s *Server) handleView(w http.ResponseWriter, r *http.Request) {
 	var sledger *Ledger
 	swid := wid + "-support-" + supportID
 	if supportID != "" {
-		g.Go(func() (err error) {
-			sdesc, err = s.describe(gctx, swid)
+		// A chat whose start is still in flight isn't found yet: show the
+		// order without it rather than failing the whole read.
+		g.Go(func() error {
+			d, err := s.describe(gctx, swid)
+			if isNotFound(err) {
+				return nil
+			}
+			sdesc = d
 			return err
 		})
-		g.Go(func() (err error) {
-			sproof, err = s.proof(gctx, swid)
+		g.Go(func() error {
+			p, err := s.proof(gctx, swid)
+			if isNotFound(err) {
+				return nil
+			}
+			sproof = p
 			return err
 		})
 		g.Go(func() error {
@@ -151,7 +161,7 @@ func (s *Server) handleView(w http.ResponseWriter, r *http.Request) {
 	}
 	view.Order = s.orderView(orderID, wid, desc, proof, ledger)
 	last, lastAt := proof.LastWorker, proof.LastWorkerAt
-	if sdesc != nil {
+	if sdesc != nil && sproof != nil {
 		view.Support = s.orderView(supportID, swid, sdesc, sproof, sledger)
 		if sproof.LastWorkerAt.After(lastAt) {
 			last, lastAt = sproof.LastWorker, sproof.LastWorkerAt
@@ -312,7 +322,10 @@ func (s *Server) handleStartSupport(w http.ResponseWriter, r *http.Request) {
 	}
 	swid := wid + "-support-" + req.ID
 	now := time.Now().UTC()
-	first := []any{map[string]any{"from": "ziggy", "text": input["greeting"], "at": now}}
+	first := []any{
+		map[string]any{"from": "member", "text": input["opener"], "at": now},
+		map[string]any{"from": "ziggy", "text": input["greeting"], "at": now},
+	}
 	_, err = s.tc.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
 		ID:                       swid,
 		TaskQueue:                s.cfg.TaskQueue,
@@ -360,9 +373,9 @@ func supportInput(orderWID string, memo map[string]any, member string) (map[stri
 		})
 	}
 	number := stringField(order, "orderNumber")
-	greeting := fmt.Sprintf("Hi! I'm Ziggy, from support. What went wrong with order %s?", number)
+	greeting := "Hi! I'm Ziggy, from support. Sorry it wasn't right. What went wrong?"
 	if first, _, _ := strings.Cut(member, " "); first != "" {
-		greeting = fmt.Sprintf("Hi %s! I'm Ziggy, from support. What went wrong with order %s?", first, number)
+		greeting = fmt.Sprintf("Hi %s! I'm Ziggy, from support. Sorry it wasn't right. What went wrong?", first)
 	}
 	return map[string]any{
 		"order": map[string]any{
@@ -372,6 +385,7 @@ func supportInput(orderWID string, memo map[string]any, member string) (map[stri
 			"payment_id": order["paymentId"], "amount_paid": order["amount"],
 			"lines": lines,
 		},
+		"opener":   fmt.Sprintf("I need some help with my order %s.", number),
 		"greeting": greeting,
 	}, true
 }
@@ -467,6 +481,11 @@ func (s *Server) decode(w http.ResponseWriter, r *http.Request, v any) bool {
 		return false
 	}
 	return true
+}
+
+func isNotFound(err error) bool {
+	var notFound *serviceerror.NotFound
+	return errors.As(err, &notFound)
 }
 
 // temporalError maps a Temporal error to a response without leaking its text
