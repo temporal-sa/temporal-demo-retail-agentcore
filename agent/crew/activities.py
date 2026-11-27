@@ -185,9 +185,16 @@ async def place_order(order_key: str, quote_id: str, payment_id: str) -> dict[st
 
 
 @activity.defn
-async def award_stardust(order_key: str, member_id: str, points: int, order_number: str) -> dict[str, Any]:
-    """Add the order's Stardust to the member's balance, once per order key."""
-    body, replayed = await _call("POST", f"/members/{member_id}/stardust", json={"points": points, "orderNumber": order_number}, idempotency_key=order_key)
+async def award_stardust(order_key: str, member_id: str, points: int, order_number: str, for_order_key: str = "", reason: str = "") -> dict[str, Any]:
+    """Add Stardust to the member's balance, once per key.
+
+    Checkout passes the order's key. Support passes the chat's key, and the
+    order's as for_order_key, so the store files it in the order's record.
+    """
+    payload: dict[str, Any] = {"points": points, "orderNumber": order_number}
+    if for_order_key:
+        payload |= {"orderKey": for_order_key, "reason": reason}
+    body, replayed = await _call("POST", f"/members/{member_id}/stardust", json=payload, idempotency_key=order_key)
     activity.logger.info("stardust awarded points=%s replayed=%s", body["points"], replayed)
     return {**body, "replayed": replayed}
 
@@ -196,21 +203,35 @@ CHECKOUT = [charge_payment, place_order, award_stardust]
 
 
 @activity.defn
-async def issue_refund(support_key: str, order_key: str, payment_id: str, amount: float, reason: str) -> dict[str, Any]:
-    """Refund part of an order's payment to the card, once per support chat."""
-    body, replayed = await _call("POST", "/refunds", json={"orderKey": order_key, "paymentId": payment_id, "amount": amount, "reason": reason}, idempotency_key=support_key)
+async def look_up_order(order_key: str) -> dict[str, Any]:
+    """The order's support record: what was paid, and every refund, comp and award support gave, from any chat."""
+    body, _ = await _call("GET", f"/orders/{order_key}/support")
+    activity.logger.info("order record refunded=%s remediations=%d", body["refunded"], len(body["remediations"]))
+    return body
+
+
+@activity.defn
+async def issue_refund(support_key: str, order_key: str, payment_id: str, amount: float, reason: str, items: list[str] | None = None) -> dict[str, Any]:
+    """Refund part of an order's payment to the card, once per support chat.
+
+    The store refuses a refund that would take the order's refunds, from
+    every chat, past what was paid.
+    """
+    payload = {"orderKey": order_key, "paymentId": payment_id, "amount": amount, "items": items or [], "reason": reason}
+    body, replayed = await _call("POST", "/refunds", json=payload, idempotency_key=support_key)
     activity.logger.info("refund refund_id=%s amount=%s replayed=%s", body["refundId"], body["amount"], replayed)
     return {**body, "replayed": replayed}
 
 
 @activity.defn
-async def place_comp(support_key: str, cafe_id: str, member_id: str, lines: list[CartLine], for_order: str, reason: str) -> dict[str, Any]:
+async def place_comp(support_key: str, cafe_id: str, member_id: str, lines: list[CartLine], for_order: str, reason: str, order_key: str = "") -> dict[str, Any]:
     """Place an order at no charge, once per support chat."""
     payload = {
         "cafeId": cafe_id,
         "memberId": member_id,
         "lines": [{"itemId": line.item_id, "qty": line.qty, "options": line.options, "note": line.note} for line in lines],
         "forOrder": for_order,
+        "orderKey": order_key,
         "reason": reason,
     }
     body, replayed = await _call("POST", "/comps", json=payload, idempotency_key=support_key)
@@ -220,4 +241,4 @@ async def place_comp(support_key: str, cafe_id: str, member_id: str, lines: list
 
 # Run by the support chat's tools, inside the Workflow, after its policy check.
 # They also use award_stardust, with the chat's key.
-SUPPORT = [issue_refund, place_comp]
+SUPPORT = [look_up_order, issue_refund, place_comp]

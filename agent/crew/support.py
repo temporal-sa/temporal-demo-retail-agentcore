@@ -1,11 +1,16 @@
 """The support chat Workflow: Ziggy as the café's support agent, after pickup.
 
 The member taps "Need help with your order?" and the API starts this
-Workflow with the order's details. Ziggy's tools run here, in the Workflow:
+Workflow with the order's details. Before Ziggy says anything, the Workflow
+looks up the order's support record in the store: what was paid and what
+support already did for it, from any chat. The member reports what went
+wrong by picking items ("missing", "wrong") or the whole order or the
+service, or by typing. Ziggy's tools run here, in the Workflow:
 
 - offer_choices shows the member buttons and waits, durably, for a tap.
 - issue_refund, place_comp_order and award_stardust_points do what they say.
-  Each checks the café's policy in plain code first. Within its limits the
+  Each reads the order's record again and checks the café's policy in plain
+  code first, so nothing is refunded or remade twice. Within its limits the
   store call runs at once. Over them, the tool escalates on its own: it tells
   the member, then waits for a support agent's decision on the page, then a
   manager's, then approves when the last timer fires. The agent never knows:
@@ -28,6 +33,7 @@ from typing import Any
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
+from temporalio.exceptions import ActivityError, ApplicationError
 
 with workflow.unsafe.imports_passed_through():
     from strands import tool
@@ -89,6 +95,31 @@ class SupportRequest:
 
 
 @dataclass
+class ReportedItem:
+    item_id: str
+    problem: str  # missing or wrong
+
+
+@dataclass
+class Report:
+    """What the member picked on the "What went wrong?" card."""
+
+    scope: str  # items, order or service
+    items: list[ReportedItem] = field(default_factory=list)
+
+
+@dataclass
+class _Said:
+    """A member's turn: what the chat shows, and what the agent reads."""
+
+    display: str
+    prompt: str
+
+
+PROBLEMS = {"missing": "Missing", "wrong": "Wrong item"}
+
+
+@dataclass
 class Choice:
     option_id: str
 
@@ -103,10 +134,23 @@ class SupportResult:
     outcome: str  # resolved or expired
 
 
-def check(kind: str, order: OrderContext, amount: float = 0.0, item_ids: list[str] | None = None, points: int = 0) -> tuple[str, str, float]:
+def settled(record: dict[str, Any]) -> dict[str, str]:
+    """Items support already put right for this order, from any chat: item_id -> "refunded" or "remade"."""
+    done: dict[str, str] = {}
+    for r in record.get("remediations", []):
+        for item in r.get("items") or []:
+            if r["kind"] == "refund":
+                done[item] = "refunded"
+            elif r["kind"] == "comp":
+                done.setdefault(item, "remade")
+    return done
+
+
+def check(kind: str, order: OrderContext, record: dict[str, Any], amount: float = 0.0, item_ids: list[str] | None = None, points: int = 0) -> tuple[str, str, float]:
     """The café's policy: "now", "approval" or "refused", with the reason and the value in credits.
 
-    Plain code, so the same request always gets the same answer. The agent
+    Plain code over the order and its support record, so the same request
+    always gets the same answer and nothing is put right twice. The agent
     doesn't see it; a tool that gets "approval" escalates on its own.
     """
     lines = {line.item_id: line for line in order.lines}
@@ -114,19 +158,26 @@ def check(kind: str, order: OrderContext, amount: float = 0.0, item_ids: list[st
     unknown = sorted({i for i in items if i not in lines})
     if unknown:
         return "refused", f"not in this order: {', '.join(unknown)}", 0.0
+    done = settled(record)
+    fresh = [i for i in items if i not in done]
+    if items and not fresh:
+        names = ", ".join(f"{lines[i].name} ({done[i]})" for i in dict.fromkeys(items))
+        return "refused", f"already put right: {names}", 0.0
     if kind == "refund":
         amount = round(amount, 2)
-        covered = sum(lines[i].line_price for i in set(items))
+        refundable = round(float(record.get("refundable", order.amount_paid)), 2)
+        covered = sum(lines[i].line_price for i in set(fresh))
         if amount <= 0:
             return "refused", "a refund needs an amount above zero", 0.0
-        if amount > order.amount_paid:
-            return "refused", f"more than the {order.amount_paid:.2f} cr paid", amount
+        if amount > refundable:
+            return "refused", f"only {refundable:.2f} cr of the {order.amount_paid:.2f} cr paid is left to refund", amount
         if amount <= min(covered, REFUND_NOW_LIMIT):
             return "now", "", amount
         return "approval", f"over {REFUND_NOW_LIMIT:.2f} cr, or more than the lines it covers", amount
     if kind == "comp":
         if not items:
             return "refused", "a comp needs the items to remake", 0.0
+        items = fresh
         value = round(sum(lines[i].unit_price for i in items), 2)
         if value > COMP_MAX:
             return "refused", f"worth more than {COMP_MAX:.2f} cr", value
@@ -138,13 +189,25 @@ def check(kind: str, order: OrderContext, amount: float = 0.0, item_ids: list[st
     return "refused", "unknown kind", 0.0
 
 
-def system_prompt(order: OrderContext) -> str:
-    lines = [{"item_id": l.item_id, "name": l.name, "qty": l.qty, "unit_price": l.unit_price, "line_price": l.line_price, "note": l.note} for l in order.lines]
+def system_prompt(order: OrderContext, record: dict[str, Any]) -> str:
+    done = settled(record)
+    lines = [{"item_id": l.item_id, "name": l.name, "qty": l.qty, "unit_price": l.unit_price, "line_price": l.line_price, "note": l.note,
+              **({"already": done[l.item_id]} if l.item_id in done else {})} for l in order.lines]
+    refundable = round(float(record.get("refundable", order.amount_paid)), 2)
+    history = "\n".join(f"- {r['kind']}: {_describe(r)}, because {r['reason']}" for r in record.get("remediations", [])) or "- nothing yet"
     return f"""You are Ziggy, the support agent in a café chain's app. {order.member_name} picked up order
 {order.order_number} from {order.cafe_name} and paid {order.amount_paid:.2f} cr for it.
-ORDER_JSON: {json.dumps({"amount_paid": order.amount_paid, "lines": lines})}
+ORDER_JSON: {json.dumps({"amount_paid": order.amount_paid, "refundable": refundable, "lines": lines})}
 
-1. Find out what went wrong. Be brief and kind.
+What support already did for this order, from the store's records (lines marked "already" are
+settled, and only {refundable:.2f} cr is left to refund):
+{history}
+
+The member's first message may end with REPORT_JSON: the items they marked missing or wrong, or
+"order" or "service" for the whole order or the service.
+
+1. Find out what went wrong. Be brief and kind. If they report something already put right, say
+   what was done and when, and don't offer it again.
 2. Offer the member two or three ways to put it right with offer_choices, such as a refund, the
    missing or wrong items made again at no charge, or Stardust. If they haven't said what they
    want, ask how they'd like it resolved. offer_choices returns what they picked or wrote.
@@ -152,6 +215,31 @@ ORDER_JSON: {json.dumps({"amount_paid": order.amount_paid, "lines": lines})}
    them the result in one or two sentences and that this chat is now closed. If a tool says no,
    tell them and offer something else.
 4. Otherwise reply in at most two short sentences."""
+
+
+def _describe(r: dict[str, Any]) -> str:
+    if r["kind"] == "refund":
+        return f"refunded {float(r['amount']):.2f} cr ({r['ref']})"
+    if r["kind"] == "comp":
+        return f"remade at no charge as order {r['ref']}"
+    return f"gave {r['points']} Stardust"
+
+
+def describe_report(report: Report, order: OrderContext) -> _Said | None:
+    """The member's report as a chat line, and as the agent reads it."""
+    names = {line.item_id: line.name for line in order.lines}
+    if report.scope == "order":
+        display = "There was a problem with my entire order."
+    elif report.scope == "service":
+        display = "There was a problem with the service."
+    else:
+        picked = [i for i in report.items if i.item_id in names and i.problem in PROBLEMS]
+        if not picked:
+            return None
+        display = " · ".join(f"{PROBLEMS[i.problem]}: {names[i.item_id]}" for i in picked)
+        report = Report(scope="items", items=picked)
+    data = {"scope": report.scope, "items": [{"item_id": i.item_id, "name": names[i.item_id], "problem": i.problem} for i in report.items]}
+    return _Said(display=display, prompt=f"{display}\nREPORT_JSON: {json.dumps(data)}")
 
 
 # The Workflow's own lines while a person reviews. Fixed text, not the
@@ -165,7 +253,8 @@ class SupportChatWorkflow:
     @workflow.init
     def __init__(self, req: SupportRequest) -> None:
         self._req = req
-        self._inbox: list[MemberMessage] = []
+        self._inbox: list[_Said] = []
+        self._record: dict[str, Any] = {}
         self._offer: list[dict[str, str]] = []
         self._offers = 0
         self._choice: str | None = None
@@ -183,30 +272,34 @@ class SupportChatWorkflow:
             "escalation": None,
             "resolution": None,
             "closed": None,
+            "record": None,
         }
-        self._agent = TemporalAgent(
+
+    @workflow.run
+    async def run(self, req: SupportRequest) -> SupportResult:
+        # Look the order up before the agent starts: its prompt says what
+        # support already did, so it doesn't offer the same thing twice.
+        await self._look_up()
+        agent = TemporalAgent(
             model=MODEL_NAME,
             start_to_close_timeout=timedelta(seconds=60),
             retry_policy=RetryPolicy(maximum_attempts=5),
-            system_prompt=system_prompt(req.order),
+            system_prompt=system_prompt(req.order, self._record),
             tools=self._tools(),
             hooks=[Progress(self)],
             callback_handler=None,
         )
-
-    @workflow.run
-    async def run(self, req: SupportRequest) -> SupportResult:
-        self._publish(model=self._agent.model.get_config().get("model_id"))
+        self._publish(model=agent.model.get_config().get("model_id"))
         while True:
             self._wait_for_member("listening")
             try:
                 await workflow.wait_condition(lambda: bool(self._inbox), timeout=self._idle())
             except asyncio.TimeoutError:
                 return self._close("expired")
-            msg = self._inbox.pop(0)
-            self._say("member", msg.text)
+            said = self._inbox.pop(0)
+            self._say("member", said.display)
             self._publish(phase="thinking", idleUntil=None)
-            reply = await self._agent.invoke_async(msg.text)
+            reply = await agent.invoke_async(said.prompt)
             if self._expired:
                 return self._close("expired")
             self._say("ziggy", str(reply).strip())
@@ -218,7 +311,17 @@ class SupportChatWorkflow:
         if self._memo["phase"] not in ("listening", "choosing"):
             workflow.logger.warning("message ignored; Ziggy is not waiting for one")
             return
-        self._inbox.append(MemberMessage(text=msg.text[:500]))
+        text = msg.text[:500]
+        self._inbox.append(_Said(display=text, prompt=text))
+
+    @workflow.signal
+    def report(self, report: Report) -> None:
+        """The member picked what went wrong on the card in the chat."""
+        said = describe_report(report, self._req.order)
+        if self._memo["phase"] != "listening" or said is None:
+            workflow.logger.warning("report ignored; Ziggy is not asking, or it names nothing in the order")
+            return
+        self._inbox.append(said)
 
     @workflow.signal
     def choose(self, choice: Choice) -> None:
@@ -310,13 +413,15 @@ class SupportChatWorkflow:
             label = next(o["label"] for o in offer if o["id"] == self._choice)
             self._say("member", label)
             return f"The member picked: {label}"
-        text = self._inbox.pop(0).text
-        self._say("member", text)
-        return f"The member didn't pick one, and wrote: {text}"
+        said = self._inbox.pop(0)
+        self._say("member", said.display)
+        return f"The member didn't pick one, and wrote: {said.prompt}"
 
     async def _act(self, kind: str, reason: str, *, amount: float = 0.0, item_ids: list[str] | None = None, points: int = 0) -> str:
         order = self._req.order
-        status, why, value = check(kind, order, amount=amount, item_ids=item_ids, points=points)
+        # The record again: another chat may have put something right since.
+        await self._look_up()
+        status, why, value = check(kind, order, self._record, amount=amount, item_ids=item_ids, points=points)
         if status == "refused":
             return f"Not possible: {why}."
         what = {"refund": f"Refund {value:.2f} cr", "comp": f"Comp order worth {value:.2f} cr", "stardust": f"{points} Stardust"}[kind]
@@ -327,7 +432,17 @@ class SupportChatWorkflow:
                 self._publish(phase="thinking")
                 return "The café declined this request."
         self._publish(phase="resolving")
-        result = await self._carry_out(kind, reason, amount=value, item_ids=item_ids or [], points=points)
+        settled_items = settled(self._record)
+        try:
+            result = await self._carry_out(kind, reason, amount=value, item_ids=[i for i in item_ids or [] if i not in settled_items], points=points)
+        except ActivityError as err:
+            # The store's own floor, such as refunds past the payment.
+            cause = err.cause
+            if not isinstance(cause, ApplicationError) or not (cause.type or "").startswith("Store4"):
+                raise
+            self._publish(phase="thinking")
+            return f"Not possible: {cause.message}."
+        await self._look_up()
         self._resolved = True
         self._publish(phase="thinking", resolution={"kind": kind, "what": what, "decidedBy": decided_by, **result})
         return f"Done: {result['summary']}."
@@ -358,7 +473,7 @@ class SupportChatWorkflow:
         key = workflow.info().workflow_id
         opts = {"start_to_close_timeout": timedelta(seconds=10), "retry_policy": RetryPolicy(maximum_attempts=10)}
         if kind == "refund":
-            r = await workflow.execute_activity(activities.issue_refund, args=[key, order.order_key, order.payment_id, amount, reason], **opts)
+            r = await workflow.execute_activity(activities.issue_refund, args=[key, order.order_key, order.payment_id, amount, reason, item_ids], **opts)
             return {"summary": f"refunded {r['amount']:.2f} cr to the card", "amount": r["amount"], "refundId": r["refundId"]}
         if kind == "comp":
             by_item = {line.item_id: line for line in order.lines}
@@ -366,11 +481,17 @@ class SupportChatWorkflow:
             for item in item_ids:
                 counts[item] = counts.get(item, 0) + 1
             lines = [activities.CartLine(item_id=i, qty=n, options=by_item[i].options, note=by_item[i].note) for i, n in counts.items()]
-            c = await workflow.execute_activity(activities.place_comp, args=[key, order.cafe_id, order.member_id, lines, order.order_number, reason], **opts)
+            c = await workflow.execute_activity(activities.place_comp, args=[key, order.cafe_id, order.member_id, lines, order.order_number, reason, order.order_key], **opts)
             ready = c["readyAt"][11:16]
             return {"summary": f"placed order {c['orderNumber']} at no charge, ready at {ready} at {c['cafeName']}", "orderNumber": c["orderNumber"], "ready": ready, "value": c["value"]}
-        a = await workflow.execute_activity(activities.award_stardust, args=[key, order.member_id, points, order.order_number], **opts)
+        a = await workflow.execute_activity(activities.award_stardust, args=[key, order.member_id, points, order.order_number, order.order_key, reason], **opts)
         return {"summary": f"added {a['points']} Stardust, for a balance of {a['balance']}", "points": a["points"], "balance": a["balance"]}
+
+    async def _look_up(self) -> None:
+        self._record = await workflow.execute_activity(
+            activities.look_up_order, self._req.order.order_key, start_to_close_timeout=timedelta(seconds=10), retry_policy=RetryPolicy(maximum_attempts=10)
+        )
+        self._publish(record=self._record)
 
     # ---------- state the page reads ----------
 

@@ -222,39 +222,72 @@ def build_cart(request: str, done: dict[str, dict[str, Any]]) -> tuple[list[dict
 
 
 def support_step(messages: Messages, system_prompt: str) -> tuple[str, tuple[str, dict[str, Any]] | None]:
-    """The stub as the support agent. It knows two openings: a missing item, and a bad order."""
+    """The stub as the support agent.
+
+    It reads the member's report from the picker (REPORT_JSON), or knows two
+    typed openings: a missing wrap, and a terrible order. It reads the order's
+    support record from ORDER_JSON, so it won't offer what's already done.
+    """
     order = json.loads(system_prompt.split("ORDER_JSON:", 1)[1].splitlines()[0])
     lines = order["lines"]
+    refundable = float(order.get("refundable", order["amount_paid"]))
     # The member's words that started this turn, and the last tool result in it.
     opening = next(_text(m) for m in reversed(messages) if m.get("role") == "user" and not any("toolResult" in b for b in m.get("content", [])))
     last = messages[-1]
     result = "".join(c.get("text", "") for b in last.get("content", []) if "toolResult" in b for c in b["toolResult"].get("content", []))
-    words = set(re.findall(r"[a-z]+", opening.lower()))
 
-    missing = next((line for line in lines if "missing" in words and set(line["name"].lower().replace("&", " ").split()) & words - {"the", "my", "order", "was", "missing"}), None)
-    bad = words & {"terrible", "awful", "cold", "wrong", "bad", "disgusting"}
+    # What the member says is wrong: items, the whole order, or the service.
+    scope, reported = "", []
+    if "REPORT_JSON:" in opening:
+        report = json.loads(opening.split("REPORT_JSON:", 1)[1].strip().splitlines()[0])
+        scope = report["scope"]
+        by_id = {line["item_id"]: line for line in lines}
+        reported = [by_id[i["item_id"]] for i in report["items"] if i["item_id"] in by_id]
+    else:
+        words = set(re.findall(r"[a-z]+", opening.lower()))
+        missing = next((line for line in lines if "missing" in words and set(line["name"].lower().replace("&", " ").split()) & words - {"the", "my", "order", "was", "missing"}), None)
+        if missing:
+            scope, reported = "items", [missing]
+        elif words & {"terrible", "awful", "cold", "wrong", "bad", "disgusting"}:
+            scope = "order"
+    open_items = [line for line in reported if "already" not in line]
+    names = " and ".join(line["name"].lower() for line in open_items)
+    value = round(sum(float(line["unit_price"]) for line in open_items), 2)
 
     if not result:
-        if missing:
-            price = float(missing["unit_price"])
-            return "", ("offer_choices", {"question": f"Sorry the {missing['name'].lower()} was missing! How would you like me to fix it?",
-                                          "choices": [f"Refund it ({price:.2f} cr)", f"Make a fresh one at no charge"]})
-        if bad:
+        if scope == "items" and reported and not open_items:
+            done = "; ".join(f"the {line['name'].lower()} was already {line['already']}" for line in reported)
+            return f"I can see {done} in an earlier chat, so that's taken care of. Anything else wrong with the order?", None
+        if scope == "items" and open_items:
+            return "", ("offer_choices", {"question": f"Sorry about the {names}! How would you like me to fix it?",
+                                          "choices": [f"Refund ({value:.2f} cr)", "Make it again at no charge"]})
+        if scope == "order":
+            if refundable <= 0:
+                return "Everything on this order has already been refunded. I'm sorry it went so badly.", None
             return "", ("offer_choices", {"question": "I'm sorry to hear that! How would you like this resolved?",
-                                          "choices": [f"Full refund ({float(order['amount_paid']):.2f} cr)", "500 Stardust"]})
-        return "I'm the offline stand-in model, so I only know two problems: a missing item, or a bad order. Try \"My order was missing the wrap\".", None
+                                          "choices": [f"Full refund ({refundable:.2f} cr)", "500 Stardust"]})
+        if scope == "service":
+            return "", ("offer_choices", {"question": "I'm sorry the service let you down. Can I add some Stardust as an apology?",
+                                          "choices": ["200 Stardust"]})
+        return "I'm the offline stand-in model, so I know reports from the card, a missing wrap or a bad order. Try \"My order was missing the wrap\".", None
+    why = f"{names} {'was' if len(open_items) == 1 else 'were'} " + ("missing" if "Missing" in opening or "missing" in opening.lower() else "wrong")
     if result.startswith("The member picked: "):
         picked = result.removeprefix("The member picked: ")
-        if picked.startswith("Refund it") and missing:
-            return "", ("issue_refund", {"amount": float(missing["unit_price"]), "item_ids": [missing["item_id"]], "reason": f"{missing['name']} was missing"})
-        if picked.startswith("Make a fresh one") and missing:
-            return "", ("place_comp_order", {"item_ids": [missing["item_id"]], "reason": f"{missing['name']} was missing"})
+        ids = [line["item_id"] for line in open_items]
+        if picked.startswith("Refund (") and open_items:
+            return "", ("issue_refund", {"amount": value, "item_ids": ids, "reason": why})
+        if picked.startswith("Make it again") and open_items:
+            return "", ("place_comp_order", {"item_ids": ids, "reason": why})
         if picked.startswith("Full refund"):
-            return "", ("issue_refund", {"amount": float(order["amount_paid"]), "item_ids": [line["item_id"] for line in lines], "reason": "the whole order was bad"})
+            return "", ("issue_refund", {"amount": refundable, "item_ids": [line["item_id"] for line in lines], "reason": "the whole order was bad"})
         if picked == "500 Stardust":
             return "", ("award_stardust_points", {"points": 500, "reason": "the whole order was bad"})
+        if picked == "200 Stardust":
+            return "", ("award_stardust_points", {"points": 200, "reason": "the service let the member down"})
     if result.startswith("Done: "):
         return f"Done: I've {result.removeprefix('Done: ').rstrip('.')}. Sorry again, and this chat is now closed.", None
+    if result.startswith("Not possible: "):
+        return f"I'm sorry, I can't do that: {result.removeprefix('Not possible: ').rstrip('.')}. What else would help?", None
     if result.startswith("The café declined"):
         return "I'm sorry, the café declined that one. What else would help?", None
     if result.startswith("The member didn't answer"):
