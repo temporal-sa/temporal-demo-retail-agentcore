@@ -15,8 +15,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
-// Entry is one write the store has accepted: a payment, an order or a
-// Stardust award, filed under the caller's Idempotency-Key.
+// Entry is one write the store has accepted: a payment, an order, a
+// Stardust award, a refund or a comp, filed under the caller's Idempotency-Key.
 type Entry struct {
 	Kind        string          `json:"kind"`
 	Key         string          `json:"key"`
@@ -28,8 +28,8 @@ type Entry struct {
 	CreatedAt time.Time `json:"createdAt"`
 }
 
-// Kinds of write, in the order an order makes them.
-var kinds = []string{"payment", "order", "stardust"}
+// Kinds of write: an order makes the first three, a support chat the others.
+var kinds = []string{"payment", "order", "stardust", "refund", "comp"}
 
 // Ledger keeps the store's writes. The store process itself holds no state.
 type Ledger interface {

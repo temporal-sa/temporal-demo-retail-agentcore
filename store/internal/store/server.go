@@ -49,6 +49,8 @@ func (s *Server) routes() http.Handler {
 	api.HandleFunc("POST "+Prefix+"/payments", s.handlePayment)
 	api.HandleFunc("POST "+Prefix+"/orders", s.handlePlaceOrder)
 	api.HandleFunc("POST "+Prefix+"/members/{member}/stardust", s.handleStardust)
+	api.HandleFunc("POST "+Prefix+"/refunds", s.handleRefund)
+	api.HandleFunc("POST "+Prefix+"/comps", s.handleComp)
 	api.HandleFunc("GET "+Prefix+"/ledger/{key}", s.handleLedger)
 
 	mux := http.NewServeMux()
@@ -216,8 +218,7 @@ func (s *Server) handlePlaceOrder(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusUnprocessableEntity, "An order needs a payment", "paymentId must be a payment this store took.")
 		return
 	}
-	number := fmt.Sprintf("%s-%04d", s.skin.Brand.OrderPrefix, 2200+binary.BigEndian.Uint32(digestBytes(key))%7800)
-	s.write(w, r, "order", key, req, Order{OrderNumber: number, CafeName: q.CafeName, ItemCount: q.ItemCount, Total: q.Total, ReadyAt: q.ReadyAt, PaymentID: req.PaymentID})
+	s.write(w, r, "order", key, req, Order{OrderNumber: s.orderNumber(key), CafeName: q.CafeName, ItemCount: q.ItemCount, Total: q.Total, ReadyAt: q.ReadyAt, PaymentID: req.PaymentID})
 }
 
 type stardustRequest struct {
@@ -248,6 +249,109 @@ func (s *Server) handleStardust(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.write(w, r, "stardust", key, req, Award{MemberID: m.ID, Points: req.Points, OrderNumber: req.OrderNumber, Balance: m.Stardust + req.Points})
+}
+
+type refundRequest struct {
+	// OrderKey is the Idempotency-Key the order's payment was taken with.
+	OrderKey  string `json:"orderKey"`
+	PaymentID string `json:"paymentId"`
+	Amount    Money  `json:"amount"`
+	Reason    string `json:"reason"`
+}
+
+type Refund struct {
+	RefundID  string `json:"refundId"`
+	PaymentID string `json:"paymentId"`
+	Amount    Money  `json:"amount"`
+	Reason    string `json:"reason"`
+}
+
+// handleRefund returns money to the card a payment was taken from, never
+// more than that payment. The limits on what needs approval are the
+// support Workflow's; this is the store's own floor.
+func (s *Server) handleRefund(w http.ResponseWriter, r *http.Request) {
+	var req refundRequest
+	key, ok := s.idempotent(w, r, &req)
+	if !ok {
+		return
+	}
+	if !idempotencyKey.MatchString(req.OrderKey) || req.Reason == "" || len(req.Reason) > 300 {
+		problem(w, http.StatusUnprocessableEntity, "Invalid refund", "orderKey is the order's Idempotency-Key and reason is 1 to 300 characters.")
+		return
+	}
+	entries, err := s.ledger.List(r.Context(), req.OrderKey)
+	if err != nil {
+		s.log.Error("ledger read failed", "key", req.OrderKey, "error", err)
+		problem(w, http.StatusServiceUnavailable, "Ledger unavailable", "Retry with the same Idempotency-Key.")
+		return
+	}
+	var paid *Payment
+	for _, e := range entries {
+		if e.Kind == "payment" {
+			paid = &Payment{}
+			if err := json.Unmarshal(e.Result, paid); err != nil {
+				problem(w, http.StatusInternalServerError, "Ledger entry unreadable")
+				return
+			}
+		}
+	}
+	switch {
+	case paid == nil || paid.PaymentID != req.PaymentID:
+		problem(w, http.StatusUnprocessableEntity, "No such payment", "paymentId must be the payment taken for orderKey.")
+		return
+	case req.Amount < 1 || req.Amount > paid.Amount:
+		problem(w, http.StatusUnprocessableEntity, "Invalid amount", fmt.Sprintf("A refund is 0.01 to %s cr, the amount paid.", paid.Amount))
+		return
+	}
+	s.write(w, r, "refund", key, req, Refund{RefundID: "rf_" + digest(key)[:12], PaymentID: req.PaymentID, Amount: req.Amount, Reason: req.Reason})
+}
+
+type compRequest struct {
+	CafeID   string `json:"cafeId"`
+	MemberID string `json:"memberId"`
+	Lines    []Line `json:"lines"`
+	// ForOrder is the order this one makes up for.
+	ForOrder string `json:"forOrder"`
+	Reason   string `json:"reason"`
+}
+
+// CompOrder is an order the café gives away: priced like any cart, charged nothing.
+type CompOrder struct {
+	OrderNumber string    `json:"orderNumber"`
+	CafeName    string    `json:"cafeName"`
+	ItemCount   int       `json:"itemCount"`
+	Value       Money     `json:"value"`
+	Total       Money     `json:"total"`
+	ReadyAt     time.Time `json:"readyAt"`
+	ForOrder    string    `json:"forOrder"`
+}
+
+func (s *Server) handleComp(w http.ResponseWriter, r *http.Request) {
+	var req compRequest
+	key, ok := s.idempotent(w, r, &req)
+	if !ok {
+		return
+	}
+	if req.ForOrder == "" || req.Reason == "" || len(req.Reason) > 300 {
+		problem(w, http.StatusUnprocessableEntity, "Invalid comp", "forOrder is required and reason is 1 to 300 characters.")
+		return
+	}
+	q, err := s.skin.PriceCart(QuoteRequest{CafeID: req.CafeID, MemberID: req.MemberID, Lines: req.Lines}, s.now())
+	var invalid *ValidationError
+	if errors.As(err, &invalid) {
+		problem(w, http.StatusUnprocessableEntity, "The comp can't be placed as it is", invalid.Problems...)
+		return
+	}
+	if err != nil {
+		s.log.Error("comp failed", "error", err)
+		problem(w, http.StatusInternalServerError, "Comp failed")
+		return
+	}
+	s.write(w, r, "comp", key, req, CompOrder{OrderNumber: s.orderNumber(key), CafeName: q.CafeName, ItemCount: q.ItemCount, Value: q.Subtotal, ReadyAt: q.ReadyAt, ForOrder: req.ForOrder})
+}
+
+func (s *Server) orderNumber(key string) string {
+	return fmt.Sprintf("%s-%04d", s.skin.Brand.OrderPrefix, 2200+binary.BigEndian.Uint32(digestBytes(key))%7800)
 }
 
 func (s *Server) handleLedger(w http.ResponseWriter, r *http.Request) {

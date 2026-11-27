@@ -140,3 +140,37 @@ func TestRefusesForgedQuotesAndMissingAuth(t *testing.T) {
 		t.Fatalf("no token: status %d", anon.StatusCode)
 	}
 }
+
+func TestRefundIsCappedAtThePaymentAndTakenOnce(t *testing.T) {
+	srv, ledger := newTestServer(t)
+	_, q := call(t, srv, "POST", Prefix+"/quotes", crewCart)
+	_, paid := call(t, srv, "POST", Prefix+"/payments", map[string]any{"quoteId": q["quoteId"]}, "Idempotency-Key", "crew-order-abc-03")
+	refund := func(amount float64) (*http.Response, map[string]any) {
+		return call(t, srv, "POST", Prefix+"/refunds", map[string]any{"orderKey": "crew-order-abc-03", "paymentId": paid["paymentId"], "amount": amount, "reason": "missing wrap"}, "Idempotency-Key", "crew-support-abc-03")
+	}
+	if resp, _ := refund(48.25); resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("more than paid: status %d", resp.StatusCode)
+	}
+	first, r1 := refund(6.4)
+	again, _ := refund(6.4)
+	if first.StatusCode != 201 || again.StatusCode != 200 || r1["amount"] != 6.40 {
+		t.Fatalf("statuses %d then %d, refund %v", first.StatusCode, again.StatusCode, r1)
+	}
+	entries, _ := ledger.List(t.Context(), "crew-support-abc-03")
+	if len(entries) != 1 || entries[0].Kind != "refund" || entries[0].Replays != 1 {
+		t.Fatalf("want one refund with one replay, got %+v", entries)
+	}
+}
+
+func TestCompIsPricedAndChargesNothing(t *testing.T) {
+	srv, _ := newTestServer(t)
+	comp := map[string]any{"cafeId": "titan-ring", "memberId": "zora-vex", "lines": []Line{{ItemID: "ceres-veggie-wrap", Qty: 1, Note: "Mo"}}, "forOrder": "OG-4242", "reason": "missing wrap"}
+	resp, c := call(t, srv, "POST", Prefix+"/comps", comp, "Idempotency-Key", "crew-support-abc-04")
+	if resp.StatusCode != 201 || c["value"] != 6.40 || c["total"] != 0.0 || c["forOrder"] != "OG-4242" {
+		t.Fatalf("status %d, comp %v", resp.StatusCode, c)
+	}
+	comp["lines"] = []Line{{ItemID: "nebula-latte", Qty: 1, Options: []string{"milk:oat"}}}
+	if resp, _ := call(t, srv, "POST", Prefix+"/comps", comp, "Idempotency-Key", "crew-support-abc-05"); resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("out of stock comp: status %d", resp.StatusCode)
+	}
+}

@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -66,12 +68,14 @@ type Money int64
 
 func (m Money) MarshalJSON() ([]byte, error) { return fmt.Appendf(nil, "%d.%02d", m/100, m%100), nil }
 
+// UnmarshalJSON reads any JSON number of credits ("6.4", "6.40", "48"),
+// rounded to the hundredth.
 func (m *Money) UnmarshalJSON(b []byte) error {
-	var whole, frac int64
-	if _, err := fmt.Sscanf(string(b), "%d.%02d", &whole, &frac); err != nil {
-		return fmt.Errorf("money %s: %w", b, err)
+	v, err := strconv.ParseFloat(string(b), 64)
+	if err != nil || math.IsInf(v, 0) || math.IsNaN(v) {
+		return fmt.Errorf("money %s: not a number", b)
 	}
-	*m = Money(whole*100 + frac)
+	*m = Money(math.Round(v * 100))
 	return nil
 }
 
