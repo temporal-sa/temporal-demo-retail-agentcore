@@ -220,8 +220,16 @@ function renderPhone(view, o, m) {
     });
     if (o.status === "Running" && (["planning", "placing"].includes(o.phase) || (o.phase === "preparing" && kitchenSignaled(o)))) items.push(zigLine(null));
   }
-  chat.replaceChildren(...items);
-  chat.scrollTop = chat.scrollHeight;
+  // Redraw only when something changed, and follow new messages only if the
+  // reader is already at the bottom: polling must not undo their scrolling.
+  const html = items.map((n) => n.outerHTML).join("");
+  if (html !== chat.lastHtml) {
+    const atBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 40;
+    const top = chat.scrollTop;
+    chat.replaceChildren(...items);
+    chat.lastHtml = html;
+    chat.scrollTop = atBottom ? chat.scrollHeight : top;
+  }
 
   const text = $("composer-text");
   const canStart = !o;
