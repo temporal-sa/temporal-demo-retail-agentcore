@@ -87,7 +87,8 @@ again. The new sandbox replayed the history, so the agent had the same cart with
 to redo its work. Only the payment, the order and one reply ran."
 
 Proof: Model calls went up by one, and "repeated after resume" is 0. The Store ledger shows one card
-charge for 48.24 cr and "charged twice: 0". Open **Open in Temporal UI** for the full history.
+charge for 48.24 cr. The Agent usage card counts the AgentCore invocations, one per sandbox, and
+the model calls and tokens across them. Open **Open in Temporal UI** for the full history.
 
 ### 5. The kitchen marks it ready: another new sandbox
 

@@ -23,7 +23,7 @@ cart, maybe for a minute, maybe for twenty, and taps Pay.
 |---|---|---|---|
 | AgentCore ends an idle session, so the wait for the member outlives the sandbox that built the cart. | The cart is on the phone, the Worker drains and the Compute card says "No sandbox running". | Pay: a new sandbox starts and finishes the order. | The Event History card shows "Sandbox 2 picked up work" after the pay Signal. |
 | The agent's work can't be redone the same way: run it again and the model may build a different cart from the one the member approved. | The new sandbox starts with an empty process. | It carries on with the same cart and makes one model call, for the reply. | Model calls go up by one; "repeated after resume" stays 0; the paid total matches the cart. |
-| A retried or resumed checkout can charge the card twice. | Payment runs on a different sandbox from the one that priced the cart. | One charge, one order, one Stardust award. | The Store ledger card: card charges 1, charged twice 0, keyed by the order's Workflow ID. |
+| A retried or resumed checkout can charge the card twice. | Payment runs on a different sandbox from the one that priced the cart. | One charge, one order, one Stardust award. | The Store ledger card: card charges 1, keyed by the order's Workflow ID. |
 
 ## Second act: support after pickup
 

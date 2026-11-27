@@ -2,11 +2,13 @@ package crew
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"strings"
 	"time"
 
+	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	historypb "go.temporal.io/api/history/v1"
 	"go.temporal.io/api/workflowservice/v1"
@@ -70,7 +72,10 @@ type Proof struct {
 	// Repeats counts calls that ran more than once (retries). Replacing a
 	// Worker adds none: the new one replays the history instead.
 	Repeats int      `json:"repeats"`
-	Workers []string `json:"workers"`
+	// Tokens the model calls reported, read from each invoke_model result.
+	InputTokens  int      `json:"inputTokens"`
+	OutputTokens int      `json:"outputTokens"`
+	Workers      []string `json:"workers"`
 	Events  int      `json:"events"`
 	// LastWorker is the Worker that most recently started or finished a
 	// task, at LastWorkerAt. A Worker can finish its work before its first
@@ -203,8 +208,14 @@ func buildProof(events []*historypb.HistoryEvent) *Proof {
 				}
 			}
 		case enumspb.EVENT_TYPE_ACTIVITY_TASK_COMPLETED:
-			touch(e.GetActivityTaskCompletedEventAttributes().GetIdentity(), at)
-			finish(p, scheduled, e.GetActivityTaskCompletedEventAttributes().GetScheduledEventId(), "completed", at)
+			c := e.GetActivityTaskCompletedEventAttributes()
+			touch(c.GetIdentity(), at)
+			finish(p, scheduled, c.GetScheduledEventId(), "completed", at)
+			if i, ok := scheduled[c.GetScheduledEventId()]; ok && p.Rows[i].Kind == "model" {
+				in, out := modelUsage(c.GetResult())
+				p.InputTokens += in
+				p.OutputTokens += out
+			}
 		case enumspb.EVENT_TYPE_ACTIVITY_TASK_FAILED:
 			finish(p, scheduled, e.GetActivityTaskFailedEventAttributes().GetScheduledEventId(), "failed", at)
 		case enumspb.EVENT_TYPE_ACTIVITY_TASK_TIMED_OUT:
@@ -219,6 +230,31 @@ func buildProof(events []*historypb.HistoryEvent) *Proof {
 		}
 	}
 	return p
+}
+
+// modelUsage reads the token counts from an invoke_model result: the
+// model's stream events, the last of which carries metadata.usage.
+func modelUsage(result *commonpb.Payloads) (in, out int) {
+	for _, payload := range result.GetPayloads() {
+		var events []struct {
+			Metadata *struct {
+				Usage struct {
+					InputTokens  int `json:"inputTokens"`
+					OutputTokens int `json:"outputTokens"`
+				} `json:"usage"`
+			} `json:"metadata"`
+		}
+		if json.Unmarshal(payload.GetData(), &events) != nil {
+			continue
+		}
+		for _, ev := range events {
+			if ev.Metadata != nil {
+				in += ev.Metadata.Usage.InputTokens
+				out += ev.Metadata.Usage.OutputTokens
+			}
+		}
+	}
+	return in, out
 }
 
 func finish(p *Proof, scheduled map[int64]int, id int64, status string, at time.Time) {

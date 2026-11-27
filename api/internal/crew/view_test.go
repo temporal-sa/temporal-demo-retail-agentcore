@@ -28,8 +28,12 @@ func history() []*historypb.HistoryEvent {
 		st := ev(enumspb.EVENT_TYPE_ACTIVITY_TASK_STARTED, func(e *historypb.HistoryEvent) {
 			e.Attributes = &historypb.HistoryEvent_ActivityTaskStartedEventAttributes{ActivityTaskStartedEventAttributes: &historypb.ActivityTaskStartedEventAttributes{ScheduledEventId: s.EventId, Identity: worker, Attempt: 1}}
 		})
+		var result *commonpb.Payloads
+		if name == "invoke_model" {
+			result = &commonpb.Payloads{Payloads: []*commonpb.Payload{{Data: []byte(`[{"messageStart":{"role":"assistant"}},{"metadata":{"usage":{"inputTokens":1200,"outputTokens":80,"totalTokens":1280}}}]`)}}}
+		}
 		c := ev(enumspb.EVENT_TYPE_ACTIVITY_TASK_COMPLETED, func(e *historypb.HistoryEvent) {
-			e.Attributes = &historypb.HistoryEvent_ActivityTaskCompletedEventAttributes{ActivityTaskCompletedEventAttributes: &historypb.ActivityTaskCompletedEventAttributes{ScheduledEventId: s.EventId}}
+			e.Attributes = &historypb.HistoryEvent_ActivityTaskCompletedEventAttributes{ActivityTaskCompletedEventAttributes: &historypb.ActivityTaskCompletedEventAttributes{ScheduledEventId: s.EventId, Result: result}}
 		})
 		out = append(out, s, st, c)
 	}
@@ -49,6 +53,9 @@ func TestBuildProofCountsEachCallOnceAndNamesBothWorkers(t *testing.T) {
 	p := buildProof(history())
 	if p.ModelCalls != 2 || p.ToolCalls != 3 || p.Repeats != 0 {
 		t.Fatalf("model=%d tool=%d repeats=%d", p.ModelCalls, p.ToolCalls, p.Repeats)
+	}
+	if p.InputTokens != 2400 || p.OutputTokens != 160 {
+		t.Fatalf("tokens in=%d out=%d", p.InputTokens, p.OutputTokens)
 	}
 	if len(p.Workers) != 2 || p.Workers[0] != "ziggy@a" || p.Workers[1] != "ziggy@b" {
 		t.Fatalf("workers %v", p.Workers)

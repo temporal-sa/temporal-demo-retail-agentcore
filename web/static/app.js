@@ -231,10 +231,12 @@ function combined(o, s) {
   const sum = (k) => (o?.proof?.[k] || 0) + (s.proof[k] || 0);
   return {
     ...o,
-    proof: { rows, workers, modelCalls: sum("modelCalls"), repeats: sum("repeats") },
+    proof: { rows, workers, modelCalls: sum("modelCalls"), repeats: sum("repeats"), inputTokens: sum("inputTokens"), outputTokens: sum("outputTokens") },
     ledger: { entries: [...(o?.ledger?.entries || []), ...(s.ledger?.entries || [])], replays: (o?.ledger?.replays || 0) + (s.ledger?.replays || 0) },
   };
 }
+
+const compact = (n) => (n >= 10000 ? `${(n / 1000).toFixed(n >= 100000 ? 0 : 1)}k` : n.toLocaleString("en-US"));
 
 const countdown = (until, now) => {
   const left = Math.max(0, Math.round((new Date(until) - new Date(now)) / 1000));
@@ -655,8 +657,6 @@ function renderBackstage(view, o, m) {
   $("stat-charges-note").textContent = payment ? `${money(payment.amount)} cr · ${payment.paymentId}` : "none until the member pays";
   $("stat-orders").textContent = count("order");
   $("stat-orders-note").textContent = order ? `${order.orderNumber} · ${order.cafeName}` : o?.quote ? "cart only" : "no cart yet";
-  $("stat-twice").textContent = Math.max(0, count("payment") - 1);
-  $("stat-replays").textContent = `duplicates rejected: ${o?.ledger?.replays ?? 0}`;
   const refunds = entries.filter((e) => e.kind === "refund").map((e) => e.result);
   const comps = entries.filter((e) => e.kind === "comp").map((e) => e.result);
   const orderAward = entries.find((e) => e.kind === "stardust");
@@ -665,6 +665,14 @@ function renderBackstage(view, o, m) {
   $("stat-refunds-note").textContent = refunds.length ? refunds.map((r) => r.refundId).join(", ") : "no refunds";
   $("stat-goodwill").textContent = comps.length + gifts.length;
   $("stat-goodwill-note").textContent = [...comps.map((x) => `${x.orderNumber} · ${money(x.value)} cr, charged 0`), ...gifts.map((g) => `+${g.points} Stardust`)].join(" · ") || "nothing given";
+  const sandboxCount = o?.proof?.workers?.length ?? 0;
+  $("stat-invocations").textContent = sandboxCount;
+  $("stat-invocations-note").textContent = sandboxCount ? "one per sandbox; each ended when idle" : "none yet";
+  const tin = o?.proof?.inputTokens ?? 0, tout = o?.proof?.outputTokens ?? 0;
+  $("stat-tokens").textContent = compact(tin + tout);
+  const stub = (state.view?.support?.model || o?.model || "").startsWith("stub");
+  $("stat-tokens-note").textContent = `in ${compact(tin)} · out ${compact(tout)}${stub ? " · stub estimate" : ""}`;
+  $("usage-scope").textContent = state.supportId ? "order + support chat" : "this order";
   $("stat-model").textContent = o?.proof?.modelCalls ?? 0;
   $("stat-repeats").textContent = `repeated after resume: ${o?.proof?.repeats ?? 0}`;
 

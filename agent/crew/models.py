@@ -94,7 +94,10 @@ class StubModel(Model):
             yield {"contentBlockDelta": {"delta": {"toolUse": {"input": json.dumps(args)}}}}
             yield {"contentBlockStop": {}}
         yield {"messageStop": {"stopReason": "tool_use" if tool else "end_turn"}}
-        yield {"metadata": {"usage": {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0}, "metrics": {"latencyMs": int(self._delay * 1000)}}}
+        # No real tokenizer offline: estimate at about four characters a token.
+        tokens_in = len(json.dumps(messages, default=str) + (system_prompt or "") + json.dumps(tool_specs or [], default=str)) // 4
+        tokens_out = len(text + (json.dumps(tool[1]) if tool else "")) // 4
+        yield {"metadata": {"usage": {"inputTokens": tokens_in, "outputTokens": tokens_out, "totalTokens": tokens_in + tokens_out}, "metrics": {"latencyMs": int(self._delay * 1000)}}}
 
 
 def _text(message: dict[str, Any]) -> str:
