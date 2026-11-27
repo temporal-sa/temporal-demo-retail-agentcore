@@ -136,13 +136,14 @@ sequenceDiagram
   participant w as Worker on AgentCore<br/>agent + its tools
   participant s as Store API (REST)
 
-  m->>t: ① "My entire order was terrible" (start chat, Signal)
+  m->>t: ① "Issue with the entire order" (start chat, Signal report)
   t->>w: Invoke a Worker
+  w->>s: GET /orders/{order}/support: what's already been done
   w->>t: ② Agent calls offer_choices: buttons, wait for a tap
   Note over w: Idle: AgentCore ends the session
   m->>t: ③ Taps "Full refund": Signal choose
   t->>w: Invoke a new Worker, replay into offer_choices
-  w->>w: ④ Agent calls issue_refund. Inside the tool:<br/>policy says 48.24 cr needs a person
+  w->>w: ④ Agent calls issue_refund. Inside the tool:<br/>policy says the refund needs a person
   w->>t: "I've escalated this", wait for Signal review<br/>or a 90 s timer, then a manager's 90 s
   Note over w: Idle: AgentCore ends the session
   st->>t: ⑤ Approve: Signal review (or the timers fire)
@@ -153,16 +154,23 @@ sequenceDiagram
 
 1. After pickup the member taps "Need help with your order?". The API reads the order from its
    Workflow's memo and starts a `SupportChatWorkflow` with it as input.
-2. The agent's tools are Workflow code, not Activities. `offer_choices` shows buttons and waits for
+2. Before the agent starts, the Workflow looks up the order's support record in the store: what was
+   paid, and every refund, free order and Stardust award from any earlier chat. The agent's prompt
+   includes it, and each action tool reads it again.
+3. The member picks what went wrong on a card (items missing or wrong, the whole order, or the
+   service) or types it, and the page sends it as the `report` or `message` Signal.
+4. The agent's tools are Workflow code, not Activities. `offer_choices` shows buttons and waits for
    a tap (the `choose` Signal), or a typed message.
-3. The agent calls `issue_refund`, `place_comp_order` or `award_stardust_points`. The tool checks
-   the café's policy in plain code. Within the limits it calls the store at once.
-4. Over the limits the tool escalates by itself: a support agent, then a manager, each with a timer,
+5. The agent calls `issue_refund`, `place_comp_order` or `award_stardust_points`. The tool checks
+   the café's policy in plain code: nothing already put right, and the order's refunds never past
+   what was paid. Within the limits it calls the store at once.
+6. Over the limits the tool escalates by itself: a support agent, then a manager, each with a timer,
    then approval on the last timer. The agent decides none of it and isn't told; its tool call
    returns when the store call is done.
-5. Every wait ends the sandbox, and every tap, decision or timer starts a new one that replays back
-   into the waiting tool call. The store calls are Activities keyed by the chat's Workflow ID.
-6. The chat closes once resolved, or after 3 minutes with no word from the member.
+7. Every wait ends the sandbox, and every tap, decision or timer starts a new one that replays back
+   into the waiting tool call. The store calls are Activities keyed by the chat's Workflow ID, and
+   the store files each in the order's record with one atomic write.
+8. The chat closes once resolved, or after 3 minutes with no word from the member.
 
 **From Strands Agents:** the agent itself. The system prompt, the tool definitions (built from the
 tool functions' docstrings), the model loop that decides which tool to call next, and the Bedrock
@@ -179,7 +187,8 @@ starts the AgentCore Worker when there is work for it.
 ended after 60 idle seconds.
 
 **The store** is a mock: a stateless REST API with an embedded menu, signed quotes, and payments,
-orders and Stardust written once per Idempotency-Key to DynamoDB.
+orders, Stardust, refunds and free orders written once per Idempotency-Key to DynamoDB, with one
+support record per order.
 
 | Path | What |
 |---|---|

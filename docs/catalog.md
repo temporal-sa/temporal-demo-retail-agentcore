@@ -42,7 +42,9 @@ been through the platform's `validate-projects` yet.
      `api` list it in `secrets`; the agent reads it with the input ref
      `secrets.store-api.STORE_API_TOKEN`. Nobody needs to know the value.
    - A DynamoDB table (`aws.dynamodb.tables.ledger`, hash key `pk`, TTL on `expiresAt`, 7 days) in
-     `STORE_LEDGER_TABLE`, for payments, orders and Stardust awards.
+     `STORE_LEDGER_TABLE`, for payments, orders, Stardust, refunds and comps, and one support
+     record per order (`case#<order key>`). No new table or permission: item reads and writes on the
+     same table.
    - Bedrock: `us.anthropic.claude-sonnet-5-5` in `BEDROCK_MODEL_ID`; model access must be enabled
      once per AWS account.
    - Both grants go to `store` and `agent` through one role (`aws.components: [store, agent]`). The

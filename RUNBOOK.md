@@ -107,11 +107,16 @@ more. The Store ledger still shows one charge.
 ### 6. Support: a missing wrap, put right on one tap
 
 The order's chat says "Chat closed". Tap **Need help with your order? Start a new chat**. The phone
-sends "I need some help with my order OG-…" and Ziggy asks what went wrong. Type "My order was
-missing the wrap" and send.
+sends "I need some help with my order OG-…" and Ziggy asks what went wrong. The step list's first
+step, "Look up the order", shows the store's record: what was paid, and that nothing has been done
+yet.
 
-Ziggy asks how to fix it, with **Refund it**, **Make a fresh one at no charge** and **Something
-else** as buttons. Wait about a minute: the sandbox ends while the buttons wait. Tap **Refund it**.
+On the **What went wrong?** card, tick the egg & stardust wrap (it defaults to **Missing**; **Wrong
+item** is the other choice) and tap **Report 1 item**. The card also offers **Issue with the entire
+order**, **Issue with the service** and **Chat about it**, which lets the member type instead.
+
+Ziggy asks how to fix it, with **Refund**, **Make it again at no charge** and **Something else** as
+buttons. Wait about a minute: the sandbox ends while the buttons wait. Tap **Refund**.
 
 A new sandbox starts, the Tool calls card shows `issue_refund` and then `POST /refunds`, the Store
 ledger's Refunded tile shows the amount, and Ziggy closes the chat.
@@ -120,10 +125,19 @@ Say: "The buttons are a tool call, offer_choices, that waits for the tap. The sa
 middle of it, and the tap brought it back into the same call. The refund was within the café's
 limits, so the tool just did it."
 
-### 7. Support: a full refund waits for a person, and the agent never knows (problems 4 and 5)
+### 7. Support remembers: the same wrap again
 
-Start another chat: "My entire order was terrible". Ziggy asks how to resolve it. Tap **Full
-refund**.
+Start another chat. On the card, the wrap is marked **Refunded** and can't be picked. Ziggy's first
+step read the same record from the store, so its prompt lists the refund.
+
+Say: "The chat looked the order up before the agent said a word, and every action tool looks it up
+again. The store keeps one record per order, written atomically, so two chats can't both refund
+the last of the payment."
+
+### 8. Support: a refund of the rest waits for a person, and the agent never knows (problems 4 and 5)
+
+In the same chat, tap **Issue with the entire order**. Ziggy offers a full refund of what's left
+(the paid amount minus the wrap). Tap **Full refund**.
 
 Ziggy says "I've escalated this to a support agent, who will review it now." The Support desk card
 shows the request with **Approve as support** and **Deny**, and a countdown; the step list shows
@@ -131,7 +145,7 @@ shows the request with **Approve as support** and **Deny**, and a countdown; the
 for **No sandbox running**.
 
 Say: "Ziggy didn't decide to escalate, and doesn't know it did. It called issue_refund. That tool is
-plain code in the Workflow: it checked the café's policy, saw a 48 cr refund is over the limit, and
+plain code in the Workflow: it checked the café's policy, saw a 41 cr refund is over the limit, and
 is now waiting for a person. Ziggy's tool call just hasn't come back yet. That's a decision we
 don't want a model making, and here it can't: no prompt can talk its way past an if statement. And
 the wait costs nothing: there's no sandbox."
@@ -145,9 +159,10 @@ Then either click **Approve as support**, or don't, and let the timers show:
 Either way a new sandbox starts, the tool carries on from where it waited, calls `POST /refunds`
 once, and returns "Done" to Ziggy, which tells the member.
 
-Proof: Refunded 48.24 on the Store ledger, once; "repeated after resume" is 0.
+Proof: the Store ledger's Refunded tile shows 48.24, the whole payment, from two refunds in two
+chats; "repeated after resume" is 0.
 
-### 8. Optional: ask for a change before paying
+### 9. Optional: ask for a change before paying
 
 On a new order, instead of paying, type "add two more donuts" and send. Locally the stub model says
 it can only build the scripted order; with Bedrock, Ziggy reprices the cart and Pay uses the new
@@ -238,15 +253,16 @@ conditional write answers with the first result.
 
 ### Escalate inside the tool, where the agent can't see it
 
-**When:** beat 7, "who decided this needed a human?"
+**When:** beat 8, "who decided this needed a human?"
 
-**Where:** the tool at [`agent/crew/support.py:256-264`](agent/crew/support.py#L256-L264), the
-policy at [`103-135`](agent/crew/support.py#L103-L135), the escalation at
-[`311-346`](agent/crew/support.py#L311-L346) (`code -g agent/crew/support.py:311`)
+**Where:** the tool at [`agent/crew/support.py:365-373`](agent/crew/support.py#L365-L373), the
+policy at [`149-189`](agent/crew/support.py#L149-L189), the escalation at
+[`420-467`](agent/crew/support.py#L420-L467) (`code -g agent/crew/support.py:420`)
 
 ```python
 async def _act(self, kind, reason, *, amount=0.0, item_ids=None, points=0) -> str:
-    status, why, value = check(kind, order, amount=amount, item_ids=item_ids, points=points)
+    await self._look_up()  # the store's record, again: another chat may have acted
+    status, why, value = check(kind, order, self._record, amount=amount, item_ids=item_ids, points=points)
     if status == "refused":
         return f"Not possible: {why}."
     if status == "approval":
@@ -276,6 +292,23 @@ Activity, all durably. While it waits the Worker drains and AgentCore ends the s
 Signal or timer starts a new Worker, which replays the agent back into the same tool call. The
 "I've escalated this" line is posted by the Workflow, in Ziggy's voice. Use this shape for any
 action where the rule must hold whatever the model says: refunds, credits, account changes.
+
+### Look the order up first, and keep one record per order
+
+**When:** beat 7, "how does it know the wrap was already refunded?"
+
+**Where:** the lookup before the agent starts at
+[`agent/crew/support.py:278-292`](agent/crew/support.py#L278-L292), and the store's atomic write at
+[`store/internal/store/ledger.go:148-192`](store/internal/store/ledger.go#L148-L192)
+(`code -g store/internal/store/ledger.go:148`)
+
+**What to understand:** the Workflow reads the order's support record with an Activity
+(`look_up_order`, `GET /orders/{order}/support`) before it builds the agent, and puts it in the
+prompt; each action tool reads it again before its policy check. The record lives in the same
+DynamoDB table as the ledger, one item per order. A refund is added with one conditional
+`UpdateItem`: once per chat's Idempotency-Key, and only while the order's refunds stay within the
+payment. That holds even if two chats refund at the same moment, which no check in the agent could
+promise.
 
 ### Show state without a running Worker
 

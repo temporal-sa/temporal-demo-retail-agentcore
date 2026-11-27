@@ -46,6 +46,12 @@ When the order closes, the phone offers "Need help with your order? Start a new 
   60-second idle timeout, so every wait ends the sandbox and every tap, decision or timer starts a
   new one, which replays back into the middle of the waiting tool call.
 - **Exactly once.** The store calls are Activities keyed by the chat's Workflow ID.
+- **One record per order.** The store keeps what support did for each order, from every chat, in
+  DynamoDB. The Workflow reads it before the agent starts and again in each action tool, and the
+  store adds a refund only while the order's refunds stay within what was paid, in one atomic
+  write.
+- **Reporting the problem.** The chat opens with a card: tick items and mark each missing or
+  wrong, or pick the whole order, the service, or "Chat about it" to type.
 - **No kitchen.** A comp is placed and the member gets its ready time; nobody marks it ready.
 
 The scripted stub model knows two openings: "My order was missing the wrap" (refund it or make a

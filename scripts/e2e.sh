@@ -3,9 +3,11 @@
 # cart wait for the member with no Worker running, replace the agent's process,
 # pay, and see a new Worker finish the order without repeating a model or tool
 # call, with one charge in the store's ledger. Then the kitchen marks it ready
-# and another new Worker tells the member. Then two support chats: a refund
-# the policy allows on the tap, and a full refund that waits for a person
-# (E2E_TIMERS=1 lets the review timers decide it instead, about 3 minutes).
+# and another new Worker tells the member. Then support: a missing wrap
+# refunded on the tap; a second chat about the same wrap, where Ziggy reads
+# the store's record and refunds nothing; and a refund of what's left of the
+# order, which waits for a person (E2E_TIMERS=1 lets the review timers
+# decide it instead, about 3 minutes).
 set -eu
 API=${API:-http://localhost:8080}
 JAR=$(mktemp); OTHER=$(mktemp); trap 'rm -f "$JAR" "$OTHER"' EXIT
@@ -91,32 +93,50 @@ swait() { # swait <python expr on v> <seconds> <what>
   done
   echo "ok: $3 (${i}s)"
 }
-support() { # support <opening message>
+opened() { # opened: start a support chat and wait for the "What went wrong?" card's turn
   SID=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
   code=$(post "/api/orders/$ID/support" "{\"id\":\"$SID\"}")
   [ "$code" = 201 ] || { echo "FAIL: support start returned $code"; exit 1; }
-  code=$(post "/api/orders/$ID/support/$SID/messages" "{\"text\":\"$1\"}")
-  [ "$code" = 202 ] || { echo "FAIL: support message returned $code"; exit 1; }
-  swait "v['support']['phase'] == 'choosing' and bool(v['support']['offer'])" 90 "Ziggy offered choices for \"$1\""
+  swait "v['support']['phase'] == 'listening' and bool(v['support'].get('record'))" 60 "the chat looked the order up first"
+}
+report() { # report <json body>
+  code=$(post "/api/orders/$ID/support/$SID/report" "$1")
+  [ "$code" = 202 ] || { echo "FAIL: report returned $code"; exit 1; }
+}
+pick_first() {
+  swait "v['support']['phase'] == 'choosing' and bool(v['support']['offer'])" 90 "Ziggy offered choices"
   first=$(sview | field "v['support']['offer'][0]['id']")
   code=$(post "/api/orders/$ID/support/$SID/choose" "{\"optionId\":\"$first\"}")
   [ "$code" = 202 ] || { echo "FAIL: choose returned $code"; exit 1; }
 }
+record() { sview | field "v['record']['$1']"; }
+WRAP=$(view | field "next(l['itemId'] for l in v['order']['quote']['lines'] if 'wrap' in l['itemId'])")
+MISSING_WRAP="{\"scope\":\"items\",\"items\":[{\"itemId\":\"$WRAP\",\"problem\":\"missing\"}]}"
 
-support "My order was missing the wrap"
-swait "v['support']['status'] == 'Completed'" 90 "the refund ran on the tap and the chat closed"
+opened
+report "$MISSING_WRAP"
+pick_first
+swait "v['support']['status'] == 'Completed'" 90 "the wrap was refunded on the tap and the chat closed"
 sview | python3 -c "
 import json, sys
-s = json.load(sys.stdin)['support']
+v = json.load(sys.stdin); s = v['support']
 assert s['resolution']['kind'] == 'refund' and s['resolution']['decidedBy'] == 'policy', s['resolution']
 assert not s.get('escalation'), s['escalation']
-assert [e['kind'] for e in s['ledger']['entries']] == ['refund'], s['ledger']
-print(f\"ok: {s['resolution']['summary']}, no review needed\")
+assert [r['kind'] for r in v['record']['remediations']] == ['refund'], v['record']
+print(f\"ok: {s['resolution']['summary']}, no review needed; the store's record has it\")
 "
+WRAP_REFUND=$(record refunded)
 
-support "My entire order was terrible"
-swait "v['support']['phase'] == 'review' and v['support']['escalation']['tier'] == 'support'" 90 "the full refund is waiting on a support agent, inside the tool"
-[ "$(sview | field "len((v['support'].get('ledger') or {}).get('entries') or [])")" = 0 ] || { echo "FAIL: refunded before review"; exit 1; }
+opened
+[ "$(sview | field "v['support']['record']['refunded']")" = "$WRAP_REFUND" ] || { echo "FAIL: the second chat's lookup missed the refund"; exit 1; }
+report "$MISSING_WRAP"
+swait "v['support']['phase'] == 'listening' and 'already refunded' in v['support']['messages'][-1]['text']" 90 "a second chat about the wrap: Ziggy read the record and refunded nothing"
+[ "$(record refunded)" = "$WRAP_REFUND" ] || { echo "FAIL: the wrap was refunded twice"; exit 1; }
+
+report '{"scope":"order"}'
+pick_first
+swait "v['support']['phase'] == 'review' and v['support']['escalation']['tier'] == 'support'" 90 "a refund of what's left is waiting on a support agent, inside the tool"
+[ "$(record refunded)" = "$WRAP_REFUND" ] || { echo "FAIL: refunded before review"; exit 1; }
 swait "not v['worker']['running']" 90 "the sandbox ended while the tool call waits"
 if [ "${E2E_TIMERS:-0}" = 1 ]; then
   swait "v['support']['escalation']['tier'] == 'manager'" 120 "nobody reviewed it, so the timer moved it to a manager"
@@ -130,10 +150,10 @@ else
 fi
 sview | python3 -c "
 import json, sys
-s = json.load(sys.stdin)['support']
-refunds = [e for e in s['ledger']['entries'] if e['kind'] == 'refund']
-assert len(refunds) == 1 and refunds[0]['result']['amount'] == 48.24 and s['ledger']['replays'] == 0, s['ledger']
-assert s['proof']['repeats'] == 0, s['proof']
-print('ok: one refund of 48.24, nothing repeated')
+v = json.load(sys.stdin); rec = v['record']
+assert [r['kind'] for r in rec['remediations']] == ['refund', 'refund'], rec
+assert rec['refunded'] == rec['paid'] and rec['refundable'] == 0, rec
+assert v['support']['proof']['repeats'] == 0, v['support']['proof']
+print(f\"ok: two refunds across two chats add up to the {rec['paid']} cr paid, and no more\")
 "
 echo PASS
