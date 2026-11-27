@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -20,6 +21,10 @@ const (
 	signalPay     = "pay"
 	signalMessage = "message"
 	signalReady   = "kitchen_ready"
+
+	supportWorkflowType = "SupportChatWorkflow"
+	signalChoose        = "choose"
+	signalReview        = "review"
 )
 
 // Server holds the API's dependencies. NewServer returns its handler.
@@ -46,6 +51,10 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /api/orders/{id}/pay", s.handlePay)
 	mux.HandleFunc("POST /api/orders/{id}/messages", s.handleMessage)
 	mux.HandleFunc("POST /api/orders/{id}/ready", s.handleReady)
+	mux.HandleFunc("POST /api/orders/{id}/support", s.handleStartSupport)
+	mux.HandleFunc("POST /api/orders/{id}/support/{sid}/messages", s.handleSupportMessage)
+	mux.HandleFunc("POST /api/orders/{id}/support/{sid}/choose", s.handleSupportChoose)
+	mux.HandleFunc("POST /api/orders/{id}/support/{sid}/review", s.handleSupportReview)
 	return mux
 }
 
@@ -67,9 +76,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 // History, the Worker list, and the store's ledger for this order. None is a
 // billable Action, and none wakes the AgentCore Worker.
 func (s *Server) handleView(w http.ResponseWriter, r *http.Request) {
-	orderID := r.URL.Query().Get("order")
-	if orderID != "" && !orderPattern.MatchString(orderID) {
-		s.problem(w, http.StatusBadRequest, "Invalid order ID", "An order ID is 8 lowercase hex characters.")
+	orderID, supportID := r.URL.Query().Get("order"), r.URL.Query().Get("support")
+	if (orderID != "" && !orderPattern.MatchString(orderID)) || (supportID != "" && (orderID == "" || !orderPattern.MatchString(supportID))) {
+		s.problem(w, http.StatusBadRequest, "Invalid order ID", "Order and support chat IDs are 8 lowercase hex characters.")
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
@@ -114,15 +123,44 @@ func (s *Server) handleView(w http.ResponseWriter, r *http.Request) {
 		}
 		return nil
 	})
+	// The support chat, if the page has one open: the same three reads.
+	var sdesc *describeResult
+	var sproof *Proof
+	var sledger *Ledger
+	swid := wid + "-support-" + supportID
+	if supportID != "" {
+		g.Go(func() (err error) {
+			sdesc, err = s.describe(gctx, swid)
+			return err
+		})
+		g.Go(func() (err error) {
+			sproof, err = s.proof(gctx, swid)
+			return err
+		})
+		g.Go(func() error {
+			var err error
+			if sledger, err = s.store.Ledger(gctx, swid); err != nil {
+				s.log.Warn("store ledger unavailable", "workflow_id", swid, "error", err)
+			}
+			return nil
+		})
+	}
 	if err := g.Wait(); err != nil {
 		s.temporalError(w, err)
 		return
 	}
 	view.Order = s.orderView(orderID, wid, desc, proof, ledger)
-	// A Worker that ran a task for this order within the heartbeat window is
-	// running, even if its first heartbeat (every 10 s) hasn't arrived yet.
-	if !view.Worker.Running && proof.LastWorker != "" && view.ServerTime.Sub(proof.LastWorkerAt) < heartbeatFresh {
-		view.Worker = WorkerStatus{Known: true, Running: true, Identity: proof.LastWorker}
+	last, lastAt := proof.LastWorker, proof.LastWorkerAt
+	if sdesc != nil {
+		view.Support = s.orderView(supportID, swid, sdesc, sproof, sledger)
+		if sproof.LastWorkerAt.After(lastAt) {
+			last, lastAt = sproof.LastWorker, sproof.LastWorkerAt
+		}
+	}
+	// A Worker that ran a task here within the heartbeat window is running,
+	// even if its first heartbeat (every 10 s) hasn't arrived yet.
+	if !view.Worker.Running && last != "" && view.ServerTime.Sub(lastAt) < heartbeatFresh {
+		view.Worker = WorkerStatus{Known: true, Running: true, Identity: last}
 	}
 	writeJSON(w, http.StatusOK, view)
 }
@@ -241,6 +279,164 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	s.signal(w, r, signalReady, map[string]any{})
 }
 
+type startSupportRequest struct {
+	ID string `json:"id"`
+}
+
+// handleStartSupport opens a support chat for a finished order. The API
+// reads the order from its Workflow's memo (Describe, no Worker needed) and
+// passes it to the new Workflow as input: the support agent starts knowing
+// what was ordered and paid. As with orders, the browser picks the chat's ID,
+// so a retried start is a 409 the browser treats as its own.
+func (s *Server) handleStartSupport(w http.ResponseWriter, r *http.Request) {
+	var req startSupportRequest
+	if !s.orderSignal(w, r, &req) {
+		return
+	}
+	if !orderPattern.MatchString(req.ID) {
+		s.problem(w, http.StatusBadRequest, "Invalid support chat ID", "id must be 8 lowercase hex characters.")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	wid := s.workflowID(r.Context(), r.PathValue("id"))
+	d, err := s.describe(ctx, wid)
+	if err != nil {
+		s.temporalError(w, err)
+		return
+	}
+	input, ok := supportInput(wid, d.memo, s.profileName(ctx))
+	if !ok {
+		s.problem(w, http.StatusConflict, "No paid order yet", "Support opens once the order is paid and placed.")
+		return
+	}
+	swid := wid + "-support-" + req.ID
+	now := time.Now().UTC()
+	first := []any{map[string]any{"from": "ziggy", "text": input["greeting"], "at": now}}
+	_, err = s.tc.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
+		ID:                       swid,
+		TaskQueue:                s.cfg.TaskQueue,
+		WorkflowIDConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_FAIL,
+		WorkflowIDReusePolicy:    enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
+		Memo:                     map[string]any{"phase": "listening", "messages": first},
+	}, supportWorkflowType, input)
+	if err != nil {
+		var started *serviceerror.WorkflowExecutionAlreadyStarted
+		if errors.As(err, &started) {
+			s.problem(w, http.StatusConflict, "Support chat already started", "A chat with this ID exists for this order.")
+			return
+		}
+		s.temporalError(w, err)
+		return
+	}
+	s.log.Info("support chat started", "workflow_id", swid)
+	writeJSON(w, http.StatusCreated, map[string]any{"support": map[string]any{"id": req.ID, "workflowId": swid, "status": "Running", "phase": "listening", "messages": first, "work": []any{}}})
+}
+
+func (s *Server) profileName(ctx context.Context) string {
+	if p, err := s.store.Profile(ctx, s.cfg.MemberID, s.cfg.CafeID); err == nil {
+		return p.Member
+	}
+	return ""
+}
+
+// supportInput builds the support Workflow's SupportRequest from the order
+// Workflow's memo: its quote (the lines and prices) and its order (number,
+// payment). ok is false until the order has been paid and placed.
+func supportInput(orderWID string, memo map[string]any, member string) (map[string]any, bool) {
+	quote, _ := memo["quote"].(map[string]any)
+	order, _ := memo["order"].(map[string]any)
+	if quote == nil || order == nil {
+		return nil, false
+	}
+	lines := []any{}
+	for _, l := range listField(quote, "lines") {
+		line, _ := l.(map[string]any)
+		options := listField(line, "options") // absent on lines with none
+		lines = append(lines, map[string]any{
+			"item_id": line["itemId"], "name": line["name"], "qty": line["qty"],
+			"unit_price": line["unitPrice"], "line_price": line["linePrice"],
+			"options": options, "note": stringField(line, "note"),
+		})
+	}
+	number := stringField(order, "orderNumber")
+	greeting := fmt.Sprintf("Hi! I'm Ziggy, from support. What went wrong with order %s?", number)
+	if first, _, _ := strings.Cut(member, " "); first != "" {
+		greeting = fmt.Sprintf("Hi %s! I'm Ziggy, from support. What went wrong with order %s?", first, number)
+	}
+	return map[string]any{
+		"order": map[string]any{
+			"order_key": orderWID, "order_number": number,
+			"cafe_id": quote["cafeId"], "cafe_name": order["cafeName"],
+			"member_id": quote["memberId"], "member_name": member,
+			"payment_id": order["paymentId"], "amount_paid": order["amount"],
+			"lines": lines,
+		},
+		"greeting": greeting,
+	}, true
+}
+
+// handleSupportMessage, handleSupportChoose and handleSupportReview send the
+// chat's Signals: the member's words, the member's tap on a button, and a
+// support agent's or manager's decision. Each is recorded with no Worker
+// running, and recording it is what starts one.
+func (s *Server) handleSupportMessage(w http.ResponseWriter, r *http.Request) {
+	var req messageRequest
+	if !s.supportSignal(w, r, &req) {
+		return
+	}
+	req.Text = strings.TrimSpace(req.Text)
+	if req.Text == "" || len(req.Text) > 500 {
+		s.problem(w, http.StatusBadRequest, "Invalid message", "text must be 1 to 500 characters.")
+		return
+	}
+	s.signalTo(w, r, s.supportID(r), signalMessage, map[string]any{"text": req.Text})
+}
+
+type chooseRequest struct {
+	OptionID string `json:"optionId"`
+}
+
+func (s *Server) handleSupportChoose(w http.ResponseWriter, r *http.Request) {
+	var req chooseRequest
+	if !s.supportSignal(w, r, &req) {
+		return
+	}
+	if req.OptionID == "" || len(req.OptionID) > 20 {
+		s.problem(w, http.StatusBadRequest, "Invalid choice", "optionId is one of the options on screen.")
+		return
+	}
+	s.signalTo(w, r, s.supportID(r), signalChoose, map[string]any{"option_id": req.OptionID})
+}
+
+type reviewRequest struct {
+	Approve *bool `json:"approve"`
+}
+
+func (s *Server) handleSupportReview(w http.ResponseWriter, r *http.Request) {
+	var req reviewRequest
+	if !s.supportSignal(w, r, &req) {
+		return
+	}
+	if req.Approve == nil {
+		s.problem(w, http.StatusBadRequest, "Invalid review", "approve is true or false.")
+		return
+	}
+	s.signalTo(w, r, s.supportID(r), signalReview, map[string]any{"approve": *req.Approve})
+}
+
+func (s *Server) supportSignal(w http.ResponseWriter, r *http.Request, body any) bool {
+	if !orderPattern.MatchString(r.PathValue("sid")) {
+		s.problem(w, http.StatusBadRequest, "Invalid support chat ID", "A support chat ID is 8 lowercase hex characters.")
+		return false
+	}
+	return s.orderSignal(w, r, body)
+}
+
+func (s *Server) supportID(r *http.Request) string {
+	return s.workflowID(r.Context(), r.PathValue("id")) + "-support-" + r.PathValue("sid")
+}
+
 func (s *Server) orderSignal(w http.ResponseWriter, r *http.Request, body any) bool {
 	if !orderPattern.MatchString(r.PathValue("id")) {
 		s.problem(w, http.StatusBadRequest, "Invalid order ID", "An order ID is 8 lowercase hex characters.")
@@ -250,7 +446,10 @@ func (s *Server) orderSignal(w http.ResponseWriter, r *http.Request, body any) b
 }
 
 func (s *Server) signal(w http.ResponseWriter, r *http.Request, name string, arg any) {
-	wid := s.workflowID(r.Context(), r.PathValue("id"))
+	s.signalTo(w, r, s.workflowID(r.Context(), r.PathValue("id")), name, arg)
+}
+
+func (s *Server) signalTo(w http.ResponseWriter, r *http.Request, wid, name string, arg any) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	if err := s.tc.SignalWorkflow(ctx, wid, "", name, arg); err != nil {

@@ -20,6 +20,8 @@ type View struct {
 	Worker         WorkerStatus `json:"worker"`
 	Profile        *Profile     `json:"profile,omitempty"`
 	Order          *OrderView   `json:"order,omitempty"`
+	// Support is the support chat the page has open for this order.
+	Support *OrderView `json:"support,omitempty"`
 }
 
 // OrderView is one crew order Workflow, read without a Worker.
@@ -44,6 +46,12 @@ type OrderView struct {
 	TemporalURL string   `json:"temporalUrl,omitempty"`
 	Proof       *Proof   `json:"proof"`
 	Ledger      *Ledger  `json:"ledger,omitempty"`
+	// A support chat's own state, from its memo.
+	Offer      any `json:"offer,omitempty"`
+	Escalation any `json:"escalation,omitempty"`
+	Resolution any `json:"resolution,omitempty"`
+	Closed     any `json:"closed,omitempty"`
+	IdleUntil  any `json:"idleUntil,omitempty"`
 }
 
 // Waiting describes a task Temporal has scheduled and no Worker has started.
@@ -73,7 +81,7 @@ type Proof struct {
 
 // ProofRow is one call or one moment worth naming in the history.
 type ProofRow struct {
-	Kind     string    `json:"kind"` // model, tool, checkout, signal, worker
+	Kind     string    `json:"kind"` // model, tool, checkout, signal, timer, worker
 	Name     string    `json:"name"`
 	Worker   string    `json:"worker,omitempty"`
 	Attempt  int32     `json:"attempt,omitempty"`
@@ -100,6 +108,8 @@ var activityKinds = map[string]string{
 	"charge_payment":    "checkout",
 	"place_order":       "checkout",
 	"award_stardust":    "checkout",
+	"issue_refund":      "checkout",
+	"place_comp":        "checkout",
 }
 
 func (s *Server) describe(ctx context.Context, wid string) (*describeResult, error) {
@@ -199,6 +209,10 @@ func buildProof(events []*historypb.HistoryEvent) *Proof {
 			finish(p, scheduled, e.GetActivityTaskFailedEventAttributes().GetScheduledEventId(), "failed", at)
 		case enumspb.EVENT_TYPE_ACTIVITY_TASK_TIMED_OUT:
 			finish(p, scheduled, e.GetActivityTaskTimedOutEventAttributes().GetScheduledEventId(), "failed", at)
+		case enumspb.EVENT_TYPE_TIMER_FIRED:
+			// A timer that fired, such as a review moving to a manager. A
+			// timer cancelled because the Signal came first leaves no row.
+			p.Rows = append(p.Rows, ProofRow{Kind: "timer", Name: "timer", Status: "completed", At: at})
 		case enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALED:
 			a := e.GetWorkflowExecutionSignaledEventAttributes()
 			p.Rows = append(p.Rows, ProofRow{Kind: "signal", Name: a.GetSignalName(), Status: "completed", At: at})
@@ -229,6 +243,11 @@ func (s *Server) orderView(orderID, wid string, d *describeResult, proof *Proof,
 		Quote:       d.memo["quote"],
 		Placed:      d.memo["order"],
 		Model:       stringField(d.memo, "model"),
+		Offer:       d.memo["offer"],
+		Escalation:  d.memo["escalation"],
+		Resolution:  d.memo["resolution"],
+		Closed:      d.memo["closed"],
+		IdleUntil:   d.memo["idleUntil"],
 		TemporalURL: s.temporalURL(wid),
 		Proof:       proof,
 		Ledger:      ledger,

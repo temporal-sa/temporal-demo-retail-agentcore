@@ -8,7 +8,8 @@ const FAST_POLL_MS = 1000;
 const SLOW_POLL_MS = 4000;
 
 const $ = (id) => document.getElementById(id);
-const state = { orderId: new URLSearchParams(location.search).get("order"), view: null, pending: null, paying: false, sending: false, marking: false, timer: null };
+const params = new URLSearchParams(location.search);
+const state = { orderId: params.get("order"), supportId: params.get("support"), view: null, pending: null, pendingSupport: null, paying: false, sending: false, marking: false, choosing: false, reviewing: false, timer: null };
 
 // ---------- small DOM helpers ----------
 function el(tag, attrs = {}, ...children) {
@@ -47,13 +48,15 @@ async function poll() {
   clearTimeout(state.timer);
   let next = SLOW_POLL_MS;
   try {
-    const view = await api("GET", "/api/view" + (state.orderId ? `?order=${state.orderId}` : ""));
+    const query = state.orderId ? `?order=${state.orderId}${state.supportId ? `&support=${state.supportId}` : ""}` : "";
+    const view = await api("GET", "/api/view" + query);
     state.view = view;
     if (view.order) state.pending = null;
+    if (view.support) state.pendingSupport = null;
     $("error-banner").hidden = true;
     render();
     const o = view.order;
-    if (o && (o.status === "Running" || view.worker.running)) next = FAST_POLL_MS;
+    if ((o && o.status === "Running") || view.support?.status === "Running" || view.worker.running) next = FAST_POLL_MS;
   } catch (err) {
     if (err.status === 404 && state.orderId) {
       // Another browser's order, or one the dev server forgot after a restart.
@@ -72,9 +75,19 @@ function setOrder(id) {
   state.orderId = id;
   state.paying = false;
   state.marking = false;
+  setSupport(null);
+}
+
+function setSupport(id) {
+  state.supportId = id;
+  state.pendingSupport = null;
+  state.choosing = false;
+  state.reviewing = false;
   const url = new URL(location.href);
-  if (id) url.searchParams.set("order", id);
-  else url.searchParams.delete("order");
+  for (const [k, v] of [["order", state.orderId], ["support", id]]) {
+    if (v) url.searchParams.set(k, v);
+    else url.searchParams.delete(k);
+  }
   history.replaceState(null, "", url);
 }
 
@@ -123,11 +136,59 @@ async function markReady() {
   poll();
 }
 
+// ---------- the support chat ----------
+async function startSupport() {
+  const id = newId();
+  setSupport(id);
+  state.pendingSupport = { id, status: "Running", phase: "listening", messages: [], work: [], proof: { rows: [], workers: [] } };
+  if (state.view) state.view = { ...state.view, support: null };
+  render();
+  try {
+    const res = await api("POST", `/api/orders/${state.orderId}/support`, { id });
+    state.pendingSupport = { ...state.pendingSupport, ...res.support };
+  } catch (err) {
+    if (err.status !== 409) {
+      setSupport(null);
+      $("error-text").textContent = `Couldn't open a support chat: ${err.message}`;
+      $("error-banner").hidden = false;
+    }
+  }
+  poll();
+}
+
+const supportPath = (what) => `/api/orders/${state.orderId}/support/${state.supportId}/${what}`;
+
+async function choose(optionId) {
+  state.choosing = true;
+  render();
+  try {
+    await api("POST", supportPath("choose"), { optionId });
+  } catch (err) {
+    state.choosing = false;
+    $("error-text").textContent = `Choice not sent: ${err.message}`;
+    $("error-banner").hidden = false;
+  }
+  poll();
+}
+
+async function review(approve) {
+  state.reviewing = true;
+  render();
+  try {
+    await api("POST", supportPath("review"), { approve });
+  } catch (err) {
+    state.reviewing = false;
+    $("error-text").textContent = `Review not sent: ${err.message}`;
+    $("error-banner").hidden = false;
+  }
+  poll();
+}
+
 async function sendMessage(text) {
   state.sending = true;
   render();
   try {
-    await api("POST", `/api/orders/${state.orderId}/messages`, { text });
+    await api("POST", state.supportId ? supportPath("messages") : `/api/orders/${state.orderId}/messages`, { text });
   } catch (err) {
     $("error-text").textContent = `Message not sent: ${err.message}`;
     $("error-banner").hidden = false;
@@ -148,6 +209,35 @@ function moment(view, o) {
   if (!running) return "invoking";
   return "working";
 }
+
+// The support chat's moment. "invoking" when a Signal or timer has made a
+// task that no Worker has picked up yet.
+function supportMoment(view, s) {
+  const running = view?.worker?.running;
+  if (s.status !== "Running") return running ? "done-draining" : "s-closed";
+  if (s.waiting && !running) return "invoking";
+  if (["listening", "choosing"].includes(s.phase)) return running ? "s-draining" : "s-member";
+  if (s.phase === "review") return running ? "s-draining" : "s-review";
+  return running ? "working" : "invoking";
+}
+
+// The backstage panels count both Workflows: the order and its support chat.
+function combined(o, s) {
+  if (!s?.proof) return o;
+  const rows = [...(o?.proof?.rows || []), ...s.proof.rows].sort((a, b) => new Date(a.at) - new Date(b.at));
+  const workers = [...new Set([...(o?.proof?.workers || []), ...s.proof.workers])];
+  const sum = (k) => (o?.proof?.[k] || 0) + (s.proof[k] || 0);
+  return {
+    ...o,
+    proof: { rows, workers, modelCalls: sum("modelCalls"), repeats: sum("repeats") },
+    ledger: { entries: [...(o?.ledger?.entries || []), ...(s.ledger?.entries || [])], replays: (o?.ledger?.replays || 0) + (s.ledger?.replays || 0) },
+  };
+}
+
+const countdown = (until, now) => {
+  const left = Math.max(0, Math.round((new Date(until) - new Date(now)) / 1000));
+  return `${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")}`;
+};
 
 // The kitchen marked the order ready: the Signal is in the history, and
 // Ziggy's message about it follows once a Worker picks it up.
@@ -170,26 +260,34 @@ const sandboxName = (o, identity) => {
 function render() {
   const view = state.view || {};
   const o = view.order || state.pending;
-  const m = moment(view, o);
-  renderHeader(view, o);
-  renderPhone(view, o, m);
-  renderAgent(view, o, m);
-  renderKitchen(view, o, m);
-  renderBackstage(view, o, m);
+  const s = state.supportId ? view.support || state.pendingSupport : null;
+  const m = s ? supportMoment(view, s) : moment(view, o);
+  const c = combined(o, s);
+  renderHeader(view, o, s);
+  if (s) {
+    renderSupportPhone(view, o, s, m);
+    renderSupportAgent(view, c, s, m);
+  } else {
+    renderPhone(view, o, m);
+    renderAgent(view, o, m);
+  }
+  renderKitchen(view, o, m, s);
+  renderBackstage(view, c, m);
 }
 
-function renderHeader(view, o) {
+function renderHeader(view, o, s) {
   const p = view.profile;
   $("brand-line").textContent = p ? `${p.brand.name} · Ziggy crew orders` : "Ziggy crew orders";
   $("app-brand").textContent = p ? p.brand.name : "Café app";
   $("app-cafe").textContent = p ? `Pickup · ${p.cafe} café` : "Pickup";
-  const extra = o?.placed?.points || 0;
+  const extra = (o?.placed?.points || 0) + (s?.resolution?.points || 0);
   $("app-points").textContent = p ? `${(p.stardust + extra).toLocaleString()} ${p.brand.rewards}` : "";
   $("phone-clock").textContent = new Date(view.serverTime || Date.now()).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
-  $("session-line").textContent = o?.workflowId ? o.workflowId.replace(/-[0-9a-f]{32}-/, "-…-") : "";
+  const shown = s?.workflowId ? s : o;
+  $("session-line").textContent = shown?.workflowId ? shown.workflowId.replace(/-[0-9a-f]{32}-/, "-…-") : "";
   for (const id of ["temporal-link", "history-link"]) {
-    $(id).hidden = !o?.temporalUrl;
-    if (o?.temporalUrl) $(id).href = o.temporalUrl;
+    $(id).hidden = !shown?.temporalUrl;
+    if (shown?.temporalUrl) $(id).href = shown.temporalUrl;
   }
   $("new-order").hidden = !o || o.status === "Running";
 }
@@ -221,17 +319,9 @@ function renderPhone(view, o, m) {
     if (o.status === "Running" && (["planning", "placing"].includes(o.phase) || (o.phase === "preparing" && kitchenSignaled(o)))) items.push(zigLine(null));
     // The Workflow has finished: Ziggy has nothing more to say about this order.
     if (o.status !== "Running") items.push(el("p", { class: "chat-closed", role: "status", text: "Chat closed" }));
+    if (o.status !== "Running" && o.placed) items.push(helpButton());
   }
-  // Redraw only when something changed, and follow new messages only if the
-  // reader is already at the bottom: polling must not undo their scrolling.
-  const html = items.map((n) => n.outerHTML).join("");
-  if (html !== chat.lastHtml) {
-    const atBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 40;
-    const top = chat.scrollTop;
-    chat.replaceChildren(...items);
-    chat.lastHtml = html;
-    chat.scrollTop = atBottom ? chat.scrollHeight : top;
-  }
+  drawChat(chat, items);
 
   const text = $("composer-text");
   const canStart = !o;
@@ -254,6 +344,53 @@ function renderPhone(view, o, m) {
     done: o?.phase === "ready" ? "Paid once, placed once, ready for pickup." : "Paid once, placed once.",
     closed: "This order is closed. Start a new one.",
   }[m];
+}
+
+// Redraw only when something changed, and follow new messages only if the
+// reader is already at the bottom: polling must not undo their scrolling.
+function drawChat(chat, items) {
+  const html = items.map((n) => n.outerHTML).join("");
+  if (html === chat.lastHtml) return;
+  const atBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 40;
+  const top = chat.scrollTop;
+  chat.replaceChildren(...items);
+  chat.lastHtml = html;
+  chat.scrollTop = atBottom ? chat.scrollHeight : top;
+}
+
+// Buttons inside the phone are handled by one listener on the chat (see
+// wiring), so a redraw that compares markup never loses a handler.
+const helpButton = () => el("button", { type: "button", class: "app-btn alt help-btn", "data-action": "help", text: "Need help with your order? Start a new chat" });
+
+function renderSupportPhone(view, o, s, m) {
+  const items = [el("p", { class: "chat-topic", text: `Support · order ${o?.placed?.orderNumber || ""}` })];
+  for (const msg of s.messages || []) items.push(msg.from === "member" ? el("div", { class: "bubble me", text: msg.text }) : zigLine(msg.text));
+  const open = s.status === "Running";
+  if (open && s.phase === "choosing" && s.offer) {
+    items.push(el("div", { class: "choices", role: "group", "aria-label": "Ziggy's options" },
+      s.offer.map((opt) => el("button", { type: "button", class: `app-btn ${opt.id === "other" ? "alt" : "pay"}`, "data-action": "choose", "data-option": opt.id, disabled: state.choosing, text: opt.label }))));
+  }
+  if (!s.offer || s.phase !== "choosing") state.choosing = false;
+  if (open && ["thinking", "resolving"].includes(s.phase)) items.push(zigLine(null));
+  if (!open) items.push(el("p", { class: "chat-closed", role: "status", text: "Chat closed" }), helpButton());
+  drawChat($("chat"), items);
+
+  const text = $("composer-text");
+  const canMessage = open && ["listening", "choosing"].includes(s.phase) && !state.sending;
+  text.disabled = !canMessage;
+  $("composer-send").disabled = text.disabled;
+  text.placeholder = !open ? "Chat closed" : s.phase === "choosing" ? "Pick an option, or type" : canMessage ? "Tell Ziggy what went wrong" : "Ziggy is working";
+  if (text.value === DEFAULT_REQUEST) text.value = "";
+
+  $("phone-caption").textContent = {
+    invoking: "Temporal is starting a sandbox for Ziggy.",
+    working: "Ziggy is working on it.",
+    "s-draining": "Wait about a minute: the sandbox drains, then AgentCore ends it.",
+    "s-member": "No sandbox is running. The member's tap or message starts a new one.",
+    "s-review": "No sandbox is running. A decision on the Support desk card, or the timer, starts a new one.",
+    "done-draining": "Support chat closed.",
+    "s-closed": "Support chat closed.",
+  }[m] || "";
 }
 
 function zigLine(text) {
@@ -300,9 +437,13 @@ const ENDPOINTS = {
   charge_payment: "POST /payments",
   place_order: "POST /orders",
   award_stardust: "POST /members/{member}/stardust",
+  issue_refund: "POST /refunds",
+  place_comp: "POST /comps",
 };
 
 function renderAgent(view, o, m) {
+  $("agent-title").textContent = "Ziggy is ordering for the crew";
+  $("tools-title").textContent = "Tool calls · store API";
   const work = o?.work || [];
   const done = (tool) => work.some((w) => w.tool === tool && w.status === "completed");
   const quoted = !!o?.quote;
@@ -372,7 +513,77 @@ function renderAgent(view, o, m) {
   $("tools").replaceChildren(...items);
 }
 
-function renderKitchen(view, o, m) {
+function renderSupportAgent(view, c, s, m) {
+  const now = view.serverTime;
+  const work = s.work || [];
+  const esc = s.escalation;
+  const res = s.resolution;
+  const phase = s.phase;
+  const order = c?.placed;
+  const memberSaid = (s.messages || []).some((msg) => msg.from === "member");
+  const offered = work.some((w) => w.tool === "offer_choices");
+  const acting = esc || res || phase === "resolving";
+  const step = (status, label, detail, time = "") => ({ status, label, detail, time });
+  const steps = [
+    step("completed", "Read the order", order ? `${order.orderNumber} · ${money(order.amount)} cr paid · passed in when the chat started` : ""),
+    step(memberSaid ? "completed" : s.status === "Running" ? "waiting" : "skipped", "Hear what went wrong", memberSaid ? "" : "Waiting on the member", !memberSaid && s.idleUntil ? `closes in ${countdown(s.idleUntil, now)}` : ""),
+    step(phase === "choosing" ? "waiting" : offered ? "completed" : "pending", "Offer choices · offer_choices", phase === "choosing" ? "Tool call waiting on the member's tap" : "", phase === "choosing" && s.idleUntil ? `closes in ${countdown(s.idleUntil, now)}` : ""),
+    step(acting ? "completed" : "pending", "Café policy check · inside the tool", esc ? `Over the limit: ${esc.why}` : res ? "Within the limit: no approval needed" : "Plain code; the agent never sees it"),
+    step(!esc ? (res ? "skipped" : "pending") : esc.decidedBy ? (esc.approved ? "completed" : "skipped") : "waiting", "Human review · inside the tool",
+      !esc ? (res ? "Not needed" : "") : esc.decidedBy ? (esc.decidedBy === "timer" ? "Nobody reviewed it: approved by the timer" : `${esc.approved ? "Approved" : "Declined"} by ${esc.decidedBy === "support" ? "a support agent" : "a manager"}`) : `Waiting on ${esc.tier === "support" ? "a support agent" : "a manager"} · the agent doesn't know`,
+      esc && !esc.decidedBy && phase === "review" ? `${esc.tier === "support" ? "to a manager" : "auto-approves"} in ${countdown(esc.until, now)}` : ""),
+    step(res ? "completed" : phase === "resolving" ? "active" : "pending", "Carry it out · store Activity", res ? res.summary : ""),
+    step(s.status !== "Running" ? "completed" : "pending", "Close the chat", s.closed ? (s.closed.outcome === "resolved" ? "Resolved" : "Expired: no reply from the member") : ""),
+  ];
+  $("agent-title").textContent = "Ziggy is helping with the order";
+  $("steps").replaceChildren(...steps.map((st, i) =>
+    el("li", { class: "step", "data-status": st.status },
+      el("span", { class: "dot", text: st.status === "completed" ? "✓" : String(i + 1) }),
+      el("span", { class: "step-label", text: st.label }),
+      st.detail ? el("span", { class: st.status === "waiting" ? "step-note" : "step-detail", text: st.detail }) : null,
+      el("span", { class: "step-time", text: st.time }))));
+
+  const badge = { invoking: ["active", "Starting"], working: ["active", "Working"], "s-draining": ["waiting", phase === "review" ? "Tool waiting on review" : "Waiting for the member"], "s-member": ["waiting", "Waiting for the member"], "s-review": ["waiting", "Tool waiting on review"], "done-draining": ["completed", "Chat closed"], "s-closed": ["completed", "Chat closed"] }[m];
+  $("agent-badge").dataset.status = badge[0];
+  $("agent-badge").textContent = badge[1];
+  $("zig-stage").dataset.phase = m === "working" || m === "invoking" ? "busy" : m === "s-member" || m === "s-review" ? "paused" : "idle";
+  $("speech").textContent = {
+    invoking: "Waking up in a new sandbox.",
+    working: phase === "resolving" ? "Calling the store." : "Thinking it over.",
+    "s-draining": "Waiting. When my sandbox goes idle, AgentCore ends it.",
+    "s-member": "My sandbox ended. The member's answer starts a new one.",
+    "s-review": "My tool call hasn't come back yet, and my sandbox ended. I don't know why it's waiting.",
+    "done-draining": "All sorted. Back to orbit.",
+    "s-closed": s.closed?.outcome === "expired" ? "The member went quiet, so the chat closed." : "All sorted. Back to orbit.",
+  }[m];
+  $("model-line").textContent = s.model ? (s.model.startsWith("stub") ? "stub model, offline" : s.model) : "model";
+
+  // The agent's tools run in the Workflow; the store calls they make are Activities.
+  $("tools-title").textContent = "Tool calls · in the Workflow, then the store API";
+  const chatStart = new Date(s.messages?.[0]?.at || 0);
+  const storeRows = (c?.proof?.rows || []).filter((r) => r.kind === "checkout" && ["issue_refund", "place_comp", "award_stardust"].includes(r.name) && new Date(r.at) >= chatStart);
+  const calls = [
+    ...work.map((w) => ({ at: w.at, li: el("li", {},
+      el("span", { class: "status-badge", "data-status": w.status, text: w.status === "completed" ? "Done" : "Failed" }),
+      el("code", { text: w.tool }),
+      el("span", { class: "where", text: "tool · in the Workflow" }),
+      el("span", { class: "result", text: w.text })) })),
+    ...storeRows.map((r) => ({ at: r.at, li: el("li", {},
+      el("span", { class: "status-badge", "data-status": r.status === "failed" ? "retrying" : r.status, text: { completed: "Done", active: "Running", pending: "Queued", failed: "Failed" }[r.status] || r.status }),
+      el("code", { text: ENDPOINTS[r.name] || r.name }),
+      el("span", { class: "where", text: `Activity · Idempotency-Key · ${r.worker ? sandboxName(c, r.worker) : ""}` }),
+      res ? el("span", { class: "result", text: res.summary }) : null) })),
+  ].sort((a, b) => new Date(a.at) - new Date(b.at)).map((x) => x.li);
+  if (phase === "choosing") calls.push(el("li", {}, el("span", { class: "status-badge", "data-status": "waiting", text: "Waiting" }), el("code", { text: "offer_choices" }), el("span", { class: "where", text: "tool · in the Workflow" }), el("span", { class: "result", text: "waiting for the member's tap" })));
+  if (phase === "review" && esc) calls.push(el("li", {}, el("span", { class: "status-badge", "data-status": "waiting", text: "Waiting" }), el("code", { text: esc.tool }), el("span", { class: "where", text: "tool · in the Workflow" }), el("span", { class: "result", text: `${esc.what}: waiting for review` })));
+  if (!calls.length) calls.push(el("li", { class: "empty-row", text: "Ziggy's tool calls show here." }));
+  $("tools").replaceChildren(...calls);
+}
+
+function renderKitchen(view, o, m, s) {
+  for (const id of ["staff-approve", "staff-deny"]) $(id).hidden = !s;
+  $("kitchen-ready").hidden = !!s;
+  if (s) return renderSupportDesk(view, s);
   $("kitchen-title").textContent = view.profile ? `Kitchen · ${view.profile.cafe}` : "Kitchen";
   const marked = kitchenSignaled(o);
   if (o?.phase !== "preparing" || marked) state.marking = false;
@@ -392,6 +603,23 @@ function renderKitchen(view, o, m) {
   btn.textContent = state.marking ? "Marking ready…" : marked || o?.phase === "ready" ? "Marked ready" : "Mark order ready";
 }
 
+function renderSupportDesk(view, s) {
+  $("kitchen-title").textContent = "Support desk";
+  const esc = s.escalation;
+  const pending = esc && !esc.decidedBy && s.phase === "review";
+  if (!pending) state.reviewing = false;
+  const who = esc?.tier === "manager" ? "a manager" : "a support agent";
+  const [status, label, text] =
+    pending ? ["waiting", esc.tier === "manager" ? "Manager review" : "Needs review", `${esc.what} for "${esc.reason}". Over the café's limit: ${esc.why}. Waiting on ${who}; ${esc.tier === "support" ? "goes to a manager" : "approved automatically"} in ${countdown(esc.until, view.serverTime)}.`]
+    : esc?.decidedBy ? [esc.approved ? "completed" : "skipped", esc.approved ? "Approved" : "Declined", `${esc.what}: ${esc.decidedBy === "timer" ? "nobody reviewed it, so the timer approved it" : `${esc.approved ? "approved" : "declined"} by ${esc.decidedBy === "support" ? "a support agent" : "a manager"}`}.`]
+    : ["pending", "Nothing to review", "Requests over the café's limits wait here for a person, and the agent's tool call waits with them."];
+  $("kitchen-badge").dataset.status = status;
+  $("kitchen-badge").textContent = label;
+  $("kitchen-text").textContent = text;
+  $("staff-approve").disabled = $("staff-deny").disabled = !pending || state.reviewing;
+  $("staff-approve").textContent = pending ? `Approve as ${esc.tier === "manager" ? "manager" : "support"}` : "Approve";
+}
+
 function renderBackstage(view, o, m) {
   const list = sandboxes(view, o);
   const rows = o?.proof?.rows || [];
@@ -408,10 +636,12 @@ function renderBackstage(view, o, m) {
   const running = view?.worker?.running;
   $("compute-badge").className = `badge ${running ? "good" : "idle"}`;
   $("compute-badge").textContent = running ? "1 running" : "Idle · 0 running";
-  const showBanner = m === "waiting" || m === "kitchen";
+  const showBanner = ["waiting", "kitchen", "s-member", "s-review"].includes(m);
   $("no-sandbox").hidden = !showBanner;
   const last = list.length ? `Sandbox ${list[list.length - 1].n}` : "The sandbox";
   if (m === "waiting") $("no-sandbox-text").textContent = `${last} drained while the member looked at the cart, and AgentCore ended it. Nothing runs or bills now. Tapping Pay starts a new one.`;
+  if (m === "s-member") $("no-sandbox-text").textContent = `${last} drained while the member decides, and AgentCore ended it. Nothing runs or bills now. Their tap or message starts a new one.`;
+  if (m === "s-review") $("no-sandbox-text").textContent = `${last} drained in the middle of the agent's tool call, which is waiting for a review. Nothing runs or bills now. A decision, or the timer, starts a new one.`;
   if (m === "kitchen") $("no-sandbox-text").textContent = `${last} drained while the kitchen makes the order, and AgentCore ended it. Nothing runs or bills now. Marking the order ready starts a new one.`;
 
   const entries = o?.ledger?.entries || [];
@@ -424,6 +654,14 @@ function renderBackstage(view, o, m) {
   $("stat-orders-note").textContent = order ? `${order.orderNumber} · ${order.cafeName}` : o?.quote ? "cart only" : "no cart yet";
   $("stat-twice").textContent = Math.max(0, count("payment") - 1);
   $("stat-replays").textContent = `duplicates rejected: ${o?.ledger?.replays ?? 0}`;
+  const refunds = entries.filter((e) => e.kind === "refund").map((e) => e.result);
+  const comps = entries.filter((e) => e.kind === "comp").map((e) => e.result);
+  const orderAward = entries.find((e) => e.kind === "stardust");
+  const gifts = entries.filter((e) => e.kind === "stardust" && e !== orderAward).map((e) => e.result);
+  $("stat-refunds").textContent = money(refunds.reduce((t, r) => t + Number(r.amount), 0));
+  $("stat-refunds-note").textContent = refunds.length ? refunds.map((r) => r.refundId).join(", ") : "no refunds";
+  $("stat-goodwill").textContent = comps.length + gifts.length;
+  $("stat-goodwill-note").textContent = [...comps.map((x) => `${x.orderNumber} · ${money(x.value)} cr, charged 0`), ...gifts.map((g) => `+${g.points} Stardust`)].join(" · ") || "nothing given";
   $("stat-model").textContent = o?.proof?.modelCalls ?? 0;
   $("stat-repeats").textContent = `repeated after resume: ${o?.proof?.repeats ?? 0}`;
 
@@ -431,6 +669,7 @@ function renderBackstage(view, o, m) {
     switch (r.kind) {
       case "worker": return [`${sandboxName(o, r.name)} picked up work`, "active"];
       case "signal": return [`Signal received · ${r.name}`, "completed"];
+      case "timer": return ["Timer fired · no Signal came in time", "waiting"];
       case "model": return [`invoke_model ${r.status} · ${sandboxName(o, r.worker)}`, r.status];
       default: return [`${r.name} ${r.status} · ${ENDPOINTS[r.name] || ""}`, r.status];
     }
@@ -439,6 +678,8 @@ function renderBackstage(view, o, m) {
     const [t, status] = text(r);
     return el("li", { "data-status": status === "pending" ? "pending" : status === "failed" ? "retrying" : status }, el("time", { text: clock(r.at) }), el("span", { text: t }));
   });
+  if (m === "s-member") events.push(el("li", { "data-status": "waiting" }, el("time", { text: clock(view.serverTime) }), el("span", { text: "Waiting for Signal · message or choose, or the idle timer · no sandbox" })));
+  if (m === "s-review") events.push(el("li", { "data-status": "waiting" }, el("time", { text: clock(view.serverTime) }), el("span", { text: "Waiting for Signal · review, or the review timer · no sandbox" })));
   if (o && m === "kitchen") events.push(el("li", { "data-status": "waiting" }, el("time", { text: clock(view.serverTime) }), el("span", { text: "Waiting for Signal · kitchen_ready · no sandbox" })));
   if (o && m === "waiting") events.push(el("li", { "data-status": "waiting" }, el("time", { text: clock(view.serverTime) }), el("span", { text: "Waiting for Signal · pay · no sandbox" })));
   if (!events.length) events.push(el("li", {}, el("time", { text: "" }), el("span", { text: "No history yet." })));
@@ -472,9 +713,18 @@ document.addEventListener("DOMContentLoaded", () => {
     if (!value || text.disabled) return;
     text.value = "";
     if (!state.view?.order && !state.pending) startOrder(value);
+    else if (state.supportId) sendMessage(value);
     else sendMessage(value);
   });
   $("kitchen-ready").addEventListener("click", markReady);
+  $("staff-approve").addEventListener("click", () => review(true));
+  $("staff-deny").addEventListener("click", () => review(false));
+  $("chat").addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-action]");
+    if (!btn || btn.disabled) return;
+    if (btn.dataset.action === "help") startSupport();
+    if (btn.dataset.action === "choose") choose(btn.dataset.option);
+  });
   $("new-order").addEventListener("click", () => {
     setOrder(null);
     state.view = { ...state.view, order: null };

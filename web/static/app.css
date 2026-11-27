@@ -13,7 +13,7 @@
 
 /* Kitchen */
 .kitchen-text { margin: 0; font-size: .9rem; }
-#kitchen-ready { align-self: flex-start; }
+.staff-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 
 /* Columns */
 .columns { display: flex; flex-wrap: wrap; gap: 18px; align-items: flex-start; }
@@ -87,6 +87,10 @@
 .typing span:nth-child(2) { animation-delay: .2s; }
 .typing span:nth-child(3) { animation-delay: .4s; }
 @keyframes blink { 0%, 100% { opacity: .3; } 50% { opacity: 1; } }
+.chat-topic { align-self: center; margin: 0 0 4px; font-size: 12px; font-weight: 600; color: var(--app-muted); }
+.choices { display: flex; flex-direction: column; gap: 6px; padding-left: 34px; }
+.choices .app-btn { width: 100%; }
+.help-btn { align-self: center; margin-top: 4px; }
 .chat-closed { display: flex; align-items: center; gap: 10px; margin: 6px 0 0; color: var(--app-muted); font-size: 12px; }
 .chat-closed::before, .chat-closed::after { content: ""; flex: 1; border-top: 1px solid var(--app-line); }
 .hint { align-self: center; text-align: center; color: var(--app-muted); font-size: 13px; padding: 24px 12px; }

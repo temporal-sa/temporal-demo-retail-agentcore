@@ -71,3 +71,21 @@ func TestLoadConfigListsEveryProblem(t *testing.T) {
 		t.Fatalf("want two problems, got %v", err)
 	}
 }
+
+func TestSupportInputWaitsForAPaidOrder(t *testing.T) {
+	if _, ok := supportInput("wid", map[string]any{"quote": map[string]any{}}, "Zora Vex"); ok {
+		t.Fatal("an order with no payment can't open support")
+	}
+	memo := map[string]any{
+		"quote": map[string]any{"cafeId": "titan-ring", "memberId": "zora-vex", "lines": []any{map[string]any{"itemId": "ceres-veggie-wrap", "name": "Ceres veggie wrap", "qty": 1.0, "unitPrice": 6.4, "linePrice": 6.4, "options": []any{}, "note": "Mo"}}},
+		"order": map[string]any{"orderNumber": "OG-4242", "cafeName": "Titan Ring", "paymentId": "ch_1", "amount": 48.24},
+	}
+	in, ok := supportInput("wid", memo, "Zora Vex")
+	order := in["order"].(map[string]any)
+	if !ok || order["payment_id"] != "ch_1" || order["amount_paid"] != 48.24 || len(order["lines"].([]any)) != 1 {
+		t.Fatalf("input %v", in)
+	}
+	if in["greeting"] != "Hi Zora! I'm Ziggy, from support. What went wrong with order OG-4242?" {
+		t.Fatalf("greeting %q", in["greeting"])
+	}
+}

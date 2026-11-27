@@ -56,7 +56,7 @@
 
     <section class="card agent-col">
       <div class="card-head">
-        <div class="stack-4"><p class="eyebrow">The agent</p><h2 class="heading">Ziggy is ordering for the crew</h2></div>
+        <div class="stack-4"><p class="eyebrow">The agent</p><h2 class="heading" id="agent-title">Ziggy is ordering for the crew</h2></div>
         <span class="status-badge" id="agent-badge" data-status="pending">Ready</span>
       </div>
       <div class="zig-stage" id="zig-stage" data-phase="idle">
@@ -65,16 +65,20 @@
       </div>
       <ol class="steps" id="steps"></ol>
       <div class="stack-6">
-        <div class="card-head"><h3 class="heading small">Tool calls · store API</h3><span class="muted mono">REST · stateless · <span id="model-line">model</span></span></div>
+        <div class="card-head"><h3 class="heading small" id="tools-title">Tool calls · store API</h3><span class="muted mono">REST · stateless · <span id="model-line">model</span></span></div>
         <ol class="tools" id="tools"></ol>
       </div>
     </section>
 
     <aside class="backstage-col">
-      <section class="card stack-10" aria-label="The kitchen">
+      <section class="card stack-10" aria-label="Staff">
         <div class="card-head"><h2 class="heading" id="kitchen-title">Kitchen</h2><span class="status-badge" id="kitchen-badge" data-status="pending">No order</span></div>
         <p class="muted kitchen-text" id="kitchen-text">Paid orders show here.</p>
-        <button type="button" class="button small primary green" id="kitchen-ready" disabled>Mark order ready</button>
+        <div class="staff-actions">
+          <button type="button" class="button small primary green" id="kitchen-ready" disabled>Mark order ready</button>
+          <button type="button" class="button small primary green" id="staff-approve" hidden>Approve</button>
+          <button type="button" class="button small secondary" id="staff-deny" hidden>Deny</button>
+        </div>
       </section>
       <section class="card stack-10">
         <div class="card-head"><h2 class="heading">Compute · AgentCore sandboxes</h2><span class="badge idle" id="compute-badge">Idle</span></div>
@@ -87,6 +91,8 @@
           <div class="stat boxed"><span class="stat-label">Card charges</span><span class="stat-value" id="stat-charges">0</span><span class="stat-note" id="stat-charges-note">none until the member pays</span></div>
           <div class="stat boxed"><span class="stat-label">Orders placed</span><span class="stat-value" id="stat-orders">0</span><span class="stat-note" id="stat-orders-note">cart only</span></div>
           <div class="stat boxed"><span class="stat-label">Charged twice</span><span class="stat-value" id="stat-twice">0</span><span class="stat-note" data-status="completed" id="stat-replays">duplicates rejected: 0</span></div>
+          <div class="stat boxed"><span class="stat-label">Refunded</span><span class="stat-value" id="stat-refunds">0.00</span><span class="stat-note" id="stat-refunds-note">no refunds</span></div>
+          <div class="stat boxed"><span class="stat-label">Comps &amp; Stardust</span><span class="stat-value" id="stat-goodwill">0</span><span class="stat-note" id="stat-goodwill-note">nothing given</span></div>
           <div class="stat boxed"><span class="stat-label">Model calls</span><span class="stat-value" id="stat-model">0</span><span class="stat-note" data-status="completed" id="stat-repeats">repeated after resume: 0</span></div>
         </div>
       </section>
