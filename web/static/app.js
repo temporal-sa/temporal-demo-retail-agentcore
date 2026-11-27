@@ -219,6 +219,8 @@ function renderPhone(view, o, m) {
       if (i === cartAfter && o.quote) items.push(cart(o));
     });
     if (o.status === "Running" && (["planning", "placing"].includes(o.phase) || (o.phase === "preparing" && kitchenSignaled(o)))) items.push(zigLine(null));
+    // The Workflow has finished: Ziggy has nothing more to say about this order.
+    if (o.status !== "Running") items.push(el("p", { class: "chat-closed", role: "status", text: "Chat closed" }));
   }
   // Redraw only when something changed, and follow new messages only if the
   // reader is already at the bottom: polling must not undo their scrolling.
@@ -237,7 +239,7 @@ function renderPhone(view, o, m) {
   text.disabled = !(canStart || canMessage);
   $("composer-send").disabled = text.disabled;
   if (canStart && !text.value && !text.dataset.touched) text.value = DEFAULT_REQUEST;
-  text.placeholder = canMessage ? "Ask for a change" : { preparing: "Ziggy will message you when it's ready", ready: "Ready for pickup", placed: "Order placed" }[o?.phase] || "Ziggy is working";
+  text.placeholder = canMessage ? "Ask for a change" : o && o.status !== "Running" ? "Chat closed" : { preparing: "Ziggy will message you when it's ready", ready: "Ready for pickup", placed: "Order placed" }[o?.phase] || "Ziggy is working";
   if (o && text.value === DEFAULT_REQUEST) text.value = "";
 
   $("phone-caption").textContent = {
