@@ -110,7 +110,7 @@ Line links point at paths on `main` until the first commit; replace them with co
 
 **When:** "What did it take to make the agent durable?"
 
-**Where:** [`agent/crew/workflows.py:110-122`](agent/crew/workflows.py#L110-L122) (`code -g agent/crew/workflows.py:110`)
+**Where:** [`agent/crew/workflows.py:114-126`](agent/crew/workflows.py#L114-L126) (`code -g agent/crew/workflows.py:114`)
 
 ```python
 self._agent = TemporalAgent(
@@ -135,7 +135,7 @@ client lives on the Worker, never in the Workflow. Docs:
 
 **When:** beats 3 and 5, "what is running while it waits?"
 
-**Where:** [`agent/crew/workflows.py:134-147`](agent/crew/workflows.py#L134-L147) and the Signal at [`185-196`](agent/crew/workflows.py#L185-L196); the kitchen's wait at [`169-176`](agent/crew/workflows.py#L169-L176) and its Signal at [`206-212`](agent/crew/workflows.py#L206-L212) (`code -g agent/crew/workflows.py:134`)
+**Where:** [`agent/crew/workflows.py:138-151`](agent/crew/workflows.py#L138-L151) and the Signal at [`190-201`](agent/crew/workflows.py#L190-L201); the kitchen's wait at [`174-181`](agent/crew/workflows.py#L174-L181) and its Signal at [`211-217`](agent/crew/workflows.py#L211-L217) (`code -g agent/crew/workflows.py:138`)
 
 ```python
 while True:
@@ -163,7 +163,7 @@ Query. The wait for the kitchen is the same pattern: `wait_condition` on a flag 
 
 **When:** beat 4, "what stops a double charge?"
 
-**Where:** [`agent/crew/workflows.py:149-161`](agent/crew/workflows.py#L149-L161) and the store's [`store/internal/store/ledger.go:58-90`](store/internal/store/ledger.go#L58-L90) (`code -g agent/crew/workflows.py:149`)
+**Where:** [`agent/crew/workflows.py:153-165`](agent/crew/workflows.py#L153-L165) and the store's [`store/internal/store/ledger.go:58-90`](store/internal/store/ledger.go#L58-L90) (`code -g agent/crew/workflows.py:153`)
 
 ```python
 key = workflow.info().workflow_id

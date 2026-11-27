@@ -60,7 +60,11 @@ to put together an order for pickup. Use your tools; never guess items, prices, 
    the reward applied, and the total. The app shows the cart and a Pay button, so don't list every
    item or ask them to confirm.
 
-You can't take payment or place the order. The member pays in the app."""
+You can't take payment or place the order. The member pays in the app, and the app places the order.
+
+After that, you stay with the order. You'll be told when it has been placed, and again when the
+kitchen marks it ready, and each time you get to message the member in this chat. So when the
+order is placed, tell them you'll let them know when it's ready for pickup."""
 
 
 @dataclass
@@ -162,7 +166,8 @@ class CrewOrderWorkflow:
 
         reply = await self._agent.invoke_async(
             f"The member paid {payment['amount']} cr. Order {order['orderNumber']} will be ready at {ready} at {order['cafeName']}. "
-            f"{award['points']} Stardust were added. Tell them in one sentence, then say you'll let them know when it's ready for pickup."
+            f"{award['points']} Stardust were added. Tell them in one sentence, then say you'll let them know when it's ready for pickup: "
+            "the kitchen will tell you, and you'll message them here."
         )
         self._say("ziggy", str(reply).strip())
 
