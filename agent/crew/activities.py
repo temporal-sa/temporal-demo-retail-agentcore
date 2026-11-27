@@ -8,6 +8,8 @@ Two kinds:
 - CHECKOUT runs after the member pays, called by the Workflow itself, never
   by the model. Each sends the Workflow ID as its Idempotency-Key, so a
   retried attempt gets the store's stored result instead of a second charge.
+- SUPPORT runs from the support chat's tools, after the café's policy (and
+  a person, when the policy says so) allows it, keyed by the chat's ID.
 
 The store is a stateless REST API (store/ in this repo) standing in for a
 café chain's real systems. On AgentCore it is reached over the public
@@ -191,3 +193,31 @@ async def award_stardust(order_key: str, member_id: str, points: int, order_numb
 
 
 CHECKOUT = [charge_payment, place_order, award_stardust]
+
+
+@activity.defn
+async def issue_refund(support_key: str, order_key: str, payment_id: str, amount: float, reason: str) -> dict[str, Any]:
+    """Refund part of an order's payment to the card, once per support chat."""
+    body, replayed = await _call("POST", "/refunds", json={"orderKey": order_key, "paymentId": payment_id, "amount": amount, "reason": reason}, idempotency_key=support_key)
+    activity.logger.info("refund refund_id=%s amount=%s replayed=%s", body["refundId"], body["amount"], replayed)
+    return {**body, "replayed": replayed}
+
+
+@activity.defn
+async def place_comp(support_key: str, cafe_id: str, member_id: str, lines: list[CartLine], for_order: str, reason: str) -> dict[str, Any]:
+    """Place an order at no charge, once per support chat."""
+    payload = {
+        "cafeId": cafe_id,
+        "memberId": member_id,
+        "lines": [{"itemId": line.item_id, "qty": line.qty, "options": line.options, "note": line.note} for line in lines],
+        "forOrder": for_order,
+        "reason": reason,
+    }
+    body, replayed = await _call("POST", "/comps", json=payload, idempotency_key=support_key)
+    activity.logger.info("comp order_number=%s value=%s replayed=%s", body["orderNumber"], body["value"], replayed)
+    return {**body, "replayed": replayed}
+
+
+# Run by the support chat's tools, inside the Workflow, after its policy check.
+# They also use award_stardust, with the chat's key.
+SUPPORT = [issue_refund, place_comp]

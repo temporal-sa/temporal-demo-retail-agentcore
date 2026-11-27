@@ -25,6 +25,7 @@ from temporalio.worker import Worker
 
 from crew import activities
 from crew.models import MODEL_NAME, StubModel
+from crew.support import ESCALATED, TO_MANAGER, Choice, OrderContext, OrderLine, Review, SupportChatWorkflow, SupportRequest, SupportResult
 from crew.workflows import CrewOrderWorkflow, KitchenReady, MemberMessage, OrderRequest, OrderResult, Payment
 
 TASK_QUEUE = "crew-test"
@@ -72,6 +73,10 @@ class FakeStore:
             return httpx.Response(201, headers=replayed, json={"paymentId": "ch_test", "amount": 12.0})
         if path == "/orders":
             return httpx.Response(201, headers=replayed, json={"orderNumber": "OG-4242", "cafeName": cafe["name"], "readyAt": "2026-11-26T12:40:00Z"})
+        if path == "/refunds":
+            return httpx.Response(201, headers=replayed, json={"refundId": "rf_test", "amount": json.loads(request.content)["amount"]})
+        if path == "/comps":
+            return httpx.Response(201, headers=replayed, json={"orderNumber": "OG-5000", "cafeName": cafe["name"], "readyAt": "2026-11-26T13:10:00Z", "value": 6.4, "total": 0})
         if path.endswith("/stardust"):
             body = json.loads(request.content)
             return httpx.Response(201, headers=replayed, json={"points": body["points"], "balance": 2430})
@@ -101,8 +106,8 @@ def worker(client: Client, identity: str) -> Worker:
         # No cache: every Workflow Task replays the whole history, as a new
         # Worker on a new AgentCore session does.
         max_cached_workflows=0,
-        workflows=[CrewOrderWorkflow],
-        activities=activities.TOOLS + activities.CHECKOUT,
+        workflows=[CrewOrderWorkflow, SupportChatWorkflow],
+        activities=activities.TOOLS + activities.CHECKOUT + activities.SUPPORT,
         plugins=[StrandsPlugin(models={MODEL_NAME: lambda: StubModel(delay_seconds=0)})],
     )
 
@@ -199,3 +204,88 @@ async def test_a_stale_payment_is_ignored_and_a_message_gets_a_reply(env: Workfl
         assert [msg["from"] for msg in m["messages"]] == ["member", "ziggy", "member", "ziggy"]
         assert not store.writes, "a payment for another cart charged nothing"
         await handle.terminate("test done")
+
+
+# ---------- the support chat ----------
+
+ORDER = OrderContext(
+    order_key="crew-test-order", order_number="OG-4242", cafe_id="titan-ring", cafe_name="Titan Ring", member_id="zora-vex", member_name="Zora Vex",
+    payment_id="ch_test", amount_paid=48.24,
+    lines=[
+        OrderLine(item_id="comet-cold-brew", name="Comet cold brew", qty=2, unit_price=4.95, line_price=9.90),
+        OrderLine(item_id="ceres-veggie-wrap", name="Ceres veggie wrap", qty=1, unit_price=6.40, line_price=6.40, note="Mo"),
+        OrderLine(item_id="zero-g-donut", name="Zero-G donut", qty=3, unit_price=2.40, line_price=7.20),
+    ],
+)
+
+
+async def start_support(client: Client, **timeouts: int) -> WorkflowHandle:
+    return await client.start_workflow(
+        SupportChatWorkflow.run,
+        SupportRequest(order=ORDER, greeting="Hi Zora, what went wrong with OG-4242?", **timeouts),
+        id=f"crew-test-support-{uuid.uuid4().hex[:8]}",
+        task_queue=TASK_QUEUE,
+        result_type=SupportResult,
+    )
+
+
+async def test_a_missing_item_is_refunded_once_after_the_member_taps(env: WorkflowEnvironment, store: FakeStore):
+    async with worker(env.client, "sandbox-1"):
+        handle = await start_support(env.client)
+        await wait_for_phase(env, handle, "listening")
+        await handle.signal(SupportChatWorkflow.message, MemberMessage(text="My order was missing the wrap"))
+        m = await wait_for_phase(env, handle, "choosing")
+    # The agent is in the middle of its offer_choices call, and sandbox 1 is gone.
+    labels = [o["label"] for o in m["offer"]]
+    assert labels == ["Refund it (6.40 cr)", "Make a fresh one at no charge", "Something else"], labels
+    await handle.signal(SupportChatWorkflow.choose, Choice(option_id=m["offer"][0]["id"]))
+    async with worker(env.client, "sandbox-2"):
+        result = await handle.result()
+    assert result.outcome == "resolved"
+    final = await memo(handle)
+    assert final["resolution"]["kind"] == "refund" and final["resolution"]["decidedBy"] == "policy"
+    assert not final.get("escalation"), "6.40 cr for the wrap needs no one's approval"
+    assert [k.split("#")[0] for k in store.writes] == ["/refunds"] and all(n == 1 for n in store.writes.values())
+    assert final["messages"][-1]["from"] == "ziggy" and "closed" in final["messages"][-1]["text"]
+
+
+async def test_a_full_refund_waits_for_a_support_agent(env: WorkflowEnvironment, store: FakeStore):
+    async with worker(env.client, "sandbox-1"):
+        handle = await start_support(env.client)
+        await wait_for_phase(env, handle, "listening")
+        await handle.signal(SupportChatWorkflow.message, MemberMessage(text="My entire order was terrible"))
+        m = await wait_for_phase(env, handle, "choosing")
+        await handle.signal(SupportChatWorkflow.choose, Choice(option_id=m["offer"][0]["id"]))
+        m = await wait_for_phase(env, handle, "review")
+        assert m["escalation"]["tier"] == "support" and m["escalation"]["what"] == "Refund 48.24 cr"
+        assert m["messages"][-1]["text"] == ESCALATED
+        assert not store.writes, "nothing is refunded before someone approves"
+        await handle.signal(SupportChatWorkflow.review, Review(approve=True))
+        result = await handle.result()
+    assert result.outcome == "resolved"
+    final = await memo(handle)
+    assert final["escalation"]["decidedBy"] == "support" and final["resolution"]["amount"] == 48.24
+
+
+async def test_an_unreviewed_refund_goes_to_a_manager_then_the_timer_approves_it(env: WorkflowEnvironment, store: FakeStore):
+    async with worker(env.client, "sandbox-1"):
+        handle = await start_support(env.client)
+        await wait_for_phase(env, handle, "listening")
+        await handle.signal(SupportChatWorkflow.message, MemberMessage(text="My entire order was terrible"))
+        m = await wait_for_phase(env, handle, "choosing")
+        await handle.signal(SupportChatWorkflow.choose, Choice(option_id=m["offer"][0]["id"]))
+        result = await handle.result()  # time skips through both review timers
+    assert result.outcome == "resolved"
+    final = await memo(handle)
+    said = [msg["text"] for msg in final["messages"] if msg["from"] == "ziggy"]
+    assert ESCALATED in said and TO_MANAGER in said
+    assert final["escalation"]["decidedBy"] == "timer"
+    assert sum(store.writes.values()) == 1
+
+
+async def test_the_chat_expires_when_the_member_goes_quiet(env: WorkflowEnvironment, store: FakeStore):
+    async with worker(env.client, "sandbox-1"):
+        handle = await start_support(env.client)
+        result = await handle.result()
+    assert result.outcome == "expired"
+    assert (await memo(handle))["closed"]["outcome"] == "expired"

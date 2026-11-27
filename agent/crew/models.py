@@ -82,7 +82,7 @@ class StubModel(Model):
 
     async def stream(self, messages: Messages, tool_specs: Any = None, system_prompt: str | None = None, **kwargs: Any) -> AsyncIterable[StreamEvent]:
         await asyncio.sleep(self._delay)
-        text, tool = next_step(messages)
+        text, tool = support_step(messages, system_prompt) if system_prompt and "ORDER_JSON:" in system_prompt else next_step(messages)
         # The tool use ID must be the same on every attempt of this call.
         tool_use_id = f"stub-{len(messages)}"
         yield {"messageStart": {"role": "assistant"}}
@@ -216,3 +216,44 @@ def build_cart(request: str, done: dict[str, dict[str, Any]]) -> tuple[list[dict
                 changes.append(f"{note}'s {item['name'].lower()} is made vegan.")
         lines.append({"item_id": item_id, "qty": line["qty"], "options": options, "note": note})
     return lines, changes
+
+
+def support_step(messages: Messages, system_prompt: str) -> tuple[str, tuple[str, dict[str, Any]] | None]:
+    """The stub as the support agent. It knows two openings: a missing item, and a bad order."""
+    order = json.loads(system_prompt.split("ORDER_JSON:", 1)[1].splitlines()[0])
+    lines = order["lines"]
+    # The member's words that started this turn, and the last tool result in it.
+    opening = next(_text(m) for m in reversed(messages) if m.get("role") == "user" and not any("toolResult" in b for b in m.get("content", [])))
+    last = messages[-1]
+    result = "".join(c.get("text", "") for b in last.get("content", []) if "toolResult" in b for c in b["toolResult"].get("content", []))
+    words = set(re.findall(r"[a-z]+", opening.lower()))
+
+    missing = next((line for line in lines if "missing" in words and set(line["name"].lower().replace("&", " ").split()) & words - {"the", "my", "order", "was", "missing"}), None)
+    bad = words & {"terrible", "awful", "cold", "wrong", "bad", "disgusting"}
+
+    if not result:
+        if missing:
+            price = float(missing["unit_price"])
+            return "", ("offer_choices", {"question": f"Sorry the {missing['name'].lower()} was missing! How would you like me to fix it?",
+                                          "choices": [f"Refund it ({price:.2f} cr)", f"Make a fresh one at no charge"]})
+        if bad:
+            return "", ("offer_choices", {"question": "I'm sorry to hear that! How would you like this resolved?",
+                                          "choices": [f"Full refund ({float(order['amount_paid']):.2f} cr)", "500 Stardust"]})
+        return "I'm the offline stand-in model, so I only know two problems: a missing item, or a bad order. Try \"My order was missing the wrap\".", None
+    if result.startswith("The member picked: "):
+        picked = result.removeprefix("The member picked: ")
+        if picked.startswith("Refund it") and missing:
+            return "", ("issue_refund", {"amount": float(missing["unit_price"]), "item_ids": [missing["item_id"]], "reason": f"{missing['name']} was missing"})
+        if picked.startswith("Make a fresh one") and missing:
+            return "", ("place_comp_order", {"item_ids": [missing["item_id"]], "reason": f"{missing['name']} was missing"})
+        if picked.startswith("Full refund"):
+            return "", ("issue_refund", {"amount": float(order["amount_paid"]), "item_ids": [line["item_id"] for line in lines], "reason": "the whole order was bad"})
+        if picked == "500 Stardust":
+            return "", ("award_stardust_points", {"points": 500, "reason": "the whole order was bad"})
+    if result.startswith("Done: "):
+        return f"Done: I've {result.removeprefix('Done: ').rstrip('.')}. Sorry again, and this chat is now closed.", None
+    if result.startswith("The café declined"):
+        return "I'm sorry, the café declined that one. What else would help?", None
+    if result.startswith("The member didn't answer"):
+        return "", None
+    return "Tell me a bit more and I'll see what I can do.", None

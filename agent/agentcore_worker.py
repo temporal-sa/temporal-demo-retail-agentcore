@@ -37,7 +37,7 @@ from temporalio.worker import (
     WorkerDeploymentConfig,
 )
 
-from crew import activities, workflows
+from crew import activities, support, workflows
 from crew.models import MODEL_NAME, ConfigError, model_factory_from_env
 
 logging.basicConfig(
@@ -150,8 +150,8 @@ async def run_worker() -> None:
         client,
         task_queue=TASK_QUEUE,
         identity=identity,
-        workflows=[workflows.CrewOrderWorkflow],
-        activities=activities.TOOLS + activities.CHECKOUT,
+        workflows=[workflows.CrewOrderWorkflow, support.SupportChatWorkflow],
+        activities=activities.TOOLS + activities.CHECKOUT + activities.SUPPORT,
         interceptors=[tracker],
         deployment_config=WorkerDeploymentConfig(
             version=WorkerDeploymentVersion(deployment_name=DEPLOYMENT_NAME, build_id=BUILD_ID),
