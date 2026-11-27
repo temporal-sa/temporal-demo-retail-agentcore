@@ -1,0 +1,129 @@
+# DemoProject for the tmprl-demo.cloud catalog (the fieldkit platform), a draft: it is not in
+# temporal-sa/temporal-fieldkit-platform yet. Its copies will be projects/test/demo/retail-agentcore.yaml
+# and projects/live/demo/retail-agentcore.yaml there; keep them in step, and validate from that
+# checkout as its projects/README.md says (guide 20). Field rules: its docs/crd-reference.md.
+#
+# This copy is for test: the agent's STORE_API_URL names the test host. The live copy needs the
+# live base domain there (docs/catalog.md, "Open items").
+apiVersion: registry.tmprl-demo.cloud/v1alpha1
+kind: DemoProject
+metadata:
+  name: retail-agentcore
+  annotations:
+    registry.tmprl-demo.cloud/operator: v2
+spec:
+  registry:
+    title: Crew Orders Agent on AgentCore
+    summary: >-
+      Built with Python, AWS Strands Agents and Amazon Bedrock on a Temporal Serverless Worker in
+      Bedrock AgentCore, plus Go services. Demonstrates Durable Execution of an agent, a Signal
+      that wakes a new sandbox, and idempotent checkout. Use case: an ordering agent builds a
+      group order in a café app, its sandbox ends while the member decides, and a new one charges
+      the card exactly once.
+    tags: [AI Agents, Serverless, Durable Execution, Signals, Idempotency, Worker Versioning]
+    temporalSdks: [Python, Go]
+    aiSdks: [Strands Agents]
+    # A project with a serverless component is never crashable; said here so nobody turns it on.
+    # Orders are kept apart by session-scoped Workflow IDs instead (README.md, "Notes").
+    crashable:
+      enabled: false
+    links:
+      runbook:
+        label: Runbook
+        url: https://github.com/temporal-sa/temporal-demo-retail-agentcore/blob/main/RUNBOOK.md
+  source:
+    repo: https://github.com/temporal-sa/temporal-demo-retail-agentcore
+  temporal:
+    auth:
+      mode: apiKey
+  secrets:
+    # The bearer token for the store API. Random per cluster; nobody needs to know it.
+    store-api:
+      generate:
+        properties: [STORE_API_TOKEN]
+  aws:
+    # One role for both: the store writes the ledger, the agent calls Bedrock. The agent's exec
+    # role has no network perimeter, so a leaked AgentCore credential could also reach the ledger
+    # table; it holds demo payments only (docs/catalog.md).
+    components: [store, agent]
+    dynamodb:
+      tables:
+        ledger:
+          env: STORE_LEDGER_TABLE
+          hashKey: {name: pk, type: S}
+          ttlAttribute: expiresAt
+    bedrock:
+      models:
+        # US cross-Region inference profile for Claude Sonnet 5.5, ACTIVE in us-west-2
+        # (aws bedrock list-inference-profiles, 2026-11-26). Model access is per account.
+        agent: {id: us.anthropic.claude-sonnet-5-5, env: BEDROCK_MODEL_ID}
+  builds:
+    web:
+      context: web
+      dockerfile: web/Dockerfile  # relative to the repo root, not the context
+    api:
+      context: api
+      dockerfile: api/Dockerfile
+    store:
+      context: store
+      dockerfile: store/Dockerfile
+    agent:
+      context: agent
+      dockerfile: agent/Dockerfile
+  components:
+    # nginx: serves the page, proxies /api and /healthz to the api Service.
+    web:
+      build: web
+      ports:
+        - {name: http, containerPort: 8080, servicePort: 80}
+      env:
+        - {name: API_URL, value: "http://api:8080"}
+    # Go API for the page. Starts orders, sends pay and message Signals, reads state with
+    # Describe, the Event History and Worker heartbeats (never a Query), and reads the store's
+    # ledger for the backstage panel.
+    api:
+      build: api
+      ports:
+        - {name: http, containerPort: 8080, servicePort: 8080}
+      temporalAccess: true
+      secrets: [store-api]
+      env:
+        - {name: TEMPORAL_TASK_QUEUE, value: retail-agentcore}
+        - {name: WORKER_LOCATION, value: agentcore}
+        - {name: STORE_INTERNAL_URL, value: "http://store:8080"}
+    # The mock store's stateless REST API: menus, stock, rewards and signed quotes from embedded
+    # data, and payments, orders and Stardust written once per Idempotency-Key to DynamoDB.
+    store:
+      build: store
+      ports:
+        - {name: http, containerPort: 8080, servicePort: 8080}
+      secrets: [store-api]
+    # The Strands agent's Temporal Worker on Bedrock AgentCore Runtime. It polls only while
+    # invoked, drains after AGENTCORE_DEBOUNCE_SECONDS without an Activity, and AgentCore ends
+    # the idle session after idleSessionTimeoutSeconds. Build ID: one per commit (unset).
+    agent:
+      build: agent
+      serverless:
+        provider: aws-agentcore
+        agentcore:
+          idleSessionTimeoutSeconds: 60
+      env:
+        - {name: TEMPORAL_TASK_QUEUE, value: retail-agentcore}
+        - {name: AGENT_MODEL, value: bedrock}
+        - {name: AGENTCORE_DEBOUNCE_SECONDS, value: "30"}
+        # AgentCore runtimes run in PUBLIC network mode, so the agent reaches the store through
+        # the demo host's public /store route, with the generated token.
+        - {name: STORE_API_URL, value: "https://retail-agentcore.test.tmprl-demo.cloud/store/v1"}
+        - name: STORE_API_TOKEN
+          valueFrom: {inputRef: secrets.store-api.STORE_API_TOKEN}
+  ingress:
+    subdomain: retail-agentcore
+    temporalAuthRequired: true
+    routes:
+      - {pathPrefix: /, component: web, port: http}
+      # Public so the AgentCore runtime can call it without SSO; the store checks the bearer
+      # token on every route under /store/v1.
+      - {pathPrefix: /store, component: store, port: http, public: true}
+  smokeCheck:
+    expectedStatus: 200
+    path: /healthz

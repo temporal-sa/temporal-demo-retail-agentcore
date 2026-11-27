@@ -1,0 +1,133 @@
+# The whole stack, with the same process boundaries and env vars as the hosted
+# deployment (guide 00, guide 12).
+#
+# What stands in for what, locally:
+#   temporal        the Temporal dev server stands in for Temporal Cloud.
+#   dynamodb        DynamoDB Local stands in for the store's ledger table.
+#   store           the mock store REST API. On the platform the agent reaches it
+#                   through a public route; here, by its Compose name.
+#   agent           the Worker image AgentCore runs, as a plain container. It serves
+#                   /invocations and /ping and starts no Worker until invoked.
+#   local-invoker   stands in for Temporal Cloud invoking the AgentCore endpoint when
+#                   the Task Queue has work and no Worker. Not on the platform.
+#   api             the Go API the page calls.
+#   web             nginx: serves the page, proxies /api and /healthz to the api.
+x-temporal-env: &temporal-env
+  TEMPORAL_ADDRESS: temporal:7233
+  TEMPORAL_NAMESPACE: default
+  TEMPORAL_TASK_QUEUE: ${TEMPORAL_TASK_QUEUE:-retail-agentcore}
+  TEMPORAL_DEPLOYMENT_NAME: retail-agentcore
+  TEMPORAL_WORKER_BUILD_ID: ${TEMPORAL_WORKER_BUILD_ID:-local-1}
+
+# A fixed token for the local stack only. The platform generates a random one.
+x-store-token: &store-token
+  STORE_API_TOKEN: ${STORE_API_TOKEN:-local-store-token-not-a-secret}
+
+services:
+  temporal:
+    # temporalio/temporal 1.10.1 (Temporal CLI), checked on Docker Hub and GitHub releases 2026-11-26.
+    image: temporalio/temporal:1.10.1@sha256:b228dadf9cdb6c7c02a1394b89dd76f827aac9760e458fce42f0899a10141225
+    command: [server, start-dev, --disable-config-file, --ip=0.0.0.0, --ui-port=8233, --ui-ip=0.0.0.0, --log-level=warn]
+    ports:
+      - "127.0.0.1:7233:7233"
+      - "127.0.0.1:8233:8233"
+    healthcheck:
+      test: ["CMD", "temporal", "--disable-config-file", "operator", "cluster", "health", "--address", "127.0.0.1:7233"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  dynamodb:
+    # amazon/dynamodb-local 3.3.2, digest checked on Docker Hub 2026-11-26.
+    image: amazon/dynamodb-local:3.3.2@sha256:6ada631ec7aa5fc83446855eb17233e3dad184fec47477e8140c6c569cfe0c86
+    command: [-jar, DynamoDBLocal.jar, -inMemory, -sharedDb]
+
+  store:
+    build: { context: store, target: store }
+    environment:
+      <<: *store-token
+      STORE_LEDGER_TABLE: store-ledger
+      STORE_CREATE_TABLE: "true"
+      DYNAMODB_ENDPOINT: http://dynamodb:8000
+      # DynamoDB Local accepts any credentials.
+      AWS_REGION: us-west-2
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+    ports:
+      - "127.0.0.1:8082:8080"
+    # Retries until DynamoDB Local accepts the table.
+    restart: on-failure
+    depends_on: [dynamodb]
+
+  agent:
+    build: { context: agent, target: runtime }
+    environment:
+      <<: [*temporal-env, *store-token]
+      STORE_API_URL: http://store:8080/store/v1
+      # stub runs offline. bedrock needs BEDROCK_MODEL_ID and AWS credentials in the
+      # environment (see RUNBOOK.md, "Run it locally").
+      AGENT_MODEL: ${AGENT_MODEL:-stub}
+      BEDROCK_MODEL_ID: ${BEDROCK_MODEL_ID:-}
+      AWS_REGION: ${AWS_REGION:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      # Shorter than the documented 60 s so the Worker visibly drains during a demo.
+      AGENTCORE_DEBOUNCE_SECONDS: ${AGENTCORE_DEBOUNCE_SECONDS:-20}
+    ports:
+      - "127.0.0.1:8081:8080"
+    # Not restarted on its own: `make kill-agent` kills it and starts it again,
+    # the way a new AgentCore session is a fresh process.
+    restart: "no"
+    depends_on:
+      temporal: { condition: service_healthy }
+      store: { condition: service_started }
+
+  local-invoker:
+    build: { context: api, target: local-invoker }
+    environment:
+      <<: *temporal-env
+      AGENT_INVOKE_URL: http://agent:8080/invocations
+    depends_on:
+      temporal: { condition: service_healthy }
+      agent: { condition: service_started }
+
+  api:
+    build: { context: api, target: api }
+    environment:
+      <<: *store-token
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      TEMPORAL_TASK_QUEUE: ${TEMPORAL_TASK_QUEUE:-retail-agentcore}
+      TEMPORAL_UI_URL: http://localhost:8233
+      TEMPORAL_UI_NAMESPACE: default
+      WORKER_LOCATION: local
+      STORE_INTERNAL_URL: http://store:8080
+    depends_on:
+      temporal: { condition: service_healthy }
+      store: { condition: service_started }
+
+  web:
+    build: { context: web }
+    environment:
+      API_URL: http://api:8080
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on: [api]
+
+  test-store:
+    build: { context: store, target: test }
+    profiles: [test]
+
+  test-agent:
+    build: { context: agent, target: test }
+    environment:
+      SKIN_PATH: /skin/skin.json
+    volumes:
+      # The agent's fake store serves the real store's data.
+      - ./store/internal/store/skin.json:/skin/skin.json:ro
+    profiles: [test]
+
+  test-api:
+    build: { context: api, target: test }
+    profiles: [test]

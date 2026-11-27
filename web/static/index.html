@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crew orders with Ziggy</title>
+<meta name="description" content="An ordering agent on Amazon Bedrock AgentCore, made durable by Temporal: the card is charged once, whichever sandbox finishes the order.">
+<link rel="icon" href="assets/brand/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="assets/css/temporal-theme.css">
+<link rel="stylesheet" href="assets/css/temporal-components.css">
+<link rel="stylesheet" href="app.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<div class="page">
+  <header class="topbar">
+    <div class="brand">
+      <img src="assets/brand/temporal-logo.svg" alt="Temporal">
+      <span class="brand-divider"></span>
+      <p class="eyebrow" id="brand-line">Ziggy crew orders</p>
+    </div>
+    <div class="topbar-actions">
+      <span class="muted mono" id="session-line"></span>
+      <a class="button small secondary ultraviolet" id="temporal-link" href="#" target="_blank" rel="noopener" hidden>Open in Temporal UI</a>
+      <button type="button" class="button small secondary green" id="new-order" hidden>New order</button>
+    </div>
+  </header>
+
+  <div class="intro">
+    <p class="eyebrow">Ziggy, the ordering agent · Strands on Amazon Bedrock AgentCore · Temporal</p>
+    <h1 class="display">Ziggy builds the crew order. The card is charged <span class="text-gradient-ultraviolet">exactly once</span>, whichever sandbox finishes it.</h1>
+  </div>
+
+  <div class="state-banner is-error" id="error-banner" role="alert" hidden><strong>Can't reach the demo's API</strong><span id="error-text">Retrying.</span></div>
+
+  <details class="card how" id="how" open>
+    <summary>
+      <span class="how-title"><span class="eyebrow">How it works · follows the run</span><span class="heading">How Temporal runs Ziggy on AgentCore</span></span>
+      <span class="status-badge" id="how-badge" data-status="pending">Now: no order yet</span>
+    </summary>
+    <div class="how-body">
+      <ol class="flow" id="flow" aria-label="Where the work runs"></ol>
+      <div class="how-text">
+        <ol id="how-steps"></ol>
+        <div class="callout" id="how-callout" data-status="pending"><p class="eyebrow" id="how-callout-title"></p><p id="how-callout-text"></p></div>
+      </div>
+    </div>
+  </details>
+
+  <main class="columns">
+    <section class="phone-col" aria-label="The member's phone">
+      <div class="phone-stage" id="phone-stage">
+        <div class="phone-fit" id="phone-fit">
+          <div class="phone" id="phone" role="group" aria-label="Orbital Grounds app">
+            <div class="phone-screen">
+              <div class="phone-statusbar"><span id="phone-clock">12:14</span><span>5G</span></div>
+              <header class="phone-chrome app-bar">
+                <span class="app-name"><strong id="app-brand">Café app</strong><span id="app-cafe">Pickup</span></span>
+                <span class="app-points" id="app-points"></span>
+              </header>
+              <div class="phone-content" id="chat" aria-live="polite"></div>
+              <form class="composer" id="composer">
+                <label class="sr-only" for="composer-text">Message Ziggy</label>
+                <textarea id="composer-text" rows="2" maxlength="500"></textarea>
+                <button type="submit" class="send" id="composer-send" aria-label="Send">➤</button>
+              </form>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p class="muted caption" id="phone-caption"></p>
+    </section>
+
+    <section class="card agent-col">
+      <div class="card-head">
+        <div class="stack-4"><p class="eyebrow">The agent</p><h2 class="heading">Ziggy is ordering for the crew</h2></div>
+        <span class="status-badge" id="agent-badge" data-status="pending">Ready</span>
+      </div>
+      <div class="zig-stage" id="zig-stage" data-phase="idle">
+        <div class="zig-orbit"><img src="assets/brand/ziggy-peek.png" alt="Ziggy, the ordering agent"></div>
+        <p class="zig-speech" id="speech">Send the order from the phone to start.</p>
+      </div>
+      <ol class="steps" id="steps"></ol>
+      <div class="stack-6">
+        <div class="card-head"><h3 class="heading small">Tool calls · store API</h3><span class="muted mono">REST · stateless · <span id="model-line">model</span></span></div>
+        <ol class="tools" id="tools"></ol>
+      </div>
+    </section>
+
+    <aside class="backstage-col">
+      <section class="card stack-10">
+        <div class="card-head"><h2 class="heading">Compute · AgentCore sandboxes</h2><span class="badge idle" id="compute-badge">Idle</span></div>
+        <div class="state-banner" id="no-sandbox" hidden><strong>No sandbox running</strong><span id="no-sandbox-text"></span></div>
+        <ul class="sandboxes" id="sandboxes"></ul>
+      </section>
+      <section class="card stack-10">
+        <div class="card-head"><h2 class="heading">Store ledger</h2><span class="muted mono" id="ledger-key">Idempotency-Key = this order</span></div>
+        <div class="stat-grid">
+          <div class="stat boxed"><span class="stat-label">Card charges</span><span class="stat-value" id="stat-charges">0</span><span class="stat-note" id="stat-charges-note">none until the member pays</span></div>
+          <div class="stat boxed"><span class="stat-label">Orders placed</span><span class="stat-value" id="stat-orders">0</span><span class="stat-note" id="stat-orders-note">cart only</span></div>
+          <div class="stat boxed"><span class="stat-label">Charged twice</span><span class="stat-value" id="stat-twice">0</span><span class="stat-note" data-status="completed" id="stat-replays">duplicates rejected: 0</span></div>
+          <div class="stat boxed"><span class="stat-label">Model calls</span><span class="stat-value" id="stat-model">0</span><span class="stat-note" data-status="completed" id="stat-repeats">repeated after resume: 0</span></div>
+        </div>
+      </section>
+      <section class="card stack-6">
+        <div class="card-head"><h2 class="heading">Event History</h2><a class="mono small-link" id="history-link" href="#" target="_blank" rel="noopener" hidden>Full history</a></div>
+        <ol class="eventlog" id="events"></ol>
+      </section>
+    </aside>
+  </main>
+</div>
+</body>
+</html>

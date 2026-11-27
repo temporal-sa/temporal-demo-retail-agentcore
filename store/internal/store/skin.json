@@ -1,0 +1,72 @@
+{
+  "brand": {
+    "name": "Orbital Grounds",
+    "rewards": "Stardust",
+    "currency": "cr",
+    "earnPerCredit": 10,
+    "orderPrefix": "OG"
+  },
+  "nonVegan": ["dairy-milk", "whipped-cream", "egg", "butter", "cheese", "honey"],
+  "cafes": [
+    {"id": "titan-ring", "name": "Titan Ring", "world": "Saturn orbit", "pickupMinutes": 25, "outOfStock": ["oat-milk"]},
+    {"id": "ceres-station", "name": "Ceres Station", "world": "Asteroid belt", "pickupMinutes": 15, "outOfStock": []},
+    {"id": "europa-dome", "name": "Europa Dome", "world": "Jupiter system", "pickupMinutes": 20, "outOfStock": ["zero-g-dough"]}
+  ],
+  "menu": [
+    {"id": "comet-cold-brew", "name": "Comet cold brew", "category": "drink", "price": 4.95, "ingredients": ["coffee"], "options": []},
+    {"id": "nebula-latte", "name": "Nebula latte", "category": "drink", "price": 5.90, "ingredients": ["espresso", "dairy-milk"], "options": ["milk:oat", "milk:almond", "milk:dairy"]},
+    {"id": "supernova-mocha", "name": "Supernova mocha", "category": "drink", "price": 6.25, "ingredients": ["espresso", "dairy-milk", "dark-chocolate", "whipped-cream"], "options": ["milk:oat", "milk:almond", "milk:dairy", "no-cream"]},
+    {"id": "stardust-tea", "name": "Stardust tea", "category": "drink", "price": 3.80, "ingredients": ["black-tea", "honey"], "options": ["no-honey"]},
+    {"id": "egg-stardust-wrap", "name": "Egg & stardust wrap", "category": "food", "price": 6.80, "ingredients": ["tortilla", "egg", "cheese", "spinach"], "options": []},
+    {"id": "ceres-veggie-wrap", "name": "Ceres veggie wrap", "category": "food", "price": 6.40, "ingredients": ["tortilla", "chickpeas", "spinach", "tahini"], "options": []},
+    {"id": "asteroid-bagel", "name": "Asteroid bagel", "category": "food", "price": 3.75, "ingredients": ["bagel"], "options": ["add:butter", "add:vegan-spread"]},
+    {"id": "zero-g-donut", "name": "Zero-G donut", "category": "food", "price": 2.40, "ingredients": ["zero-g-dough", "sugar"], "options": []},
+    {"id": "orbit-croissant", "name": "Orbit croissant", "category": "food", "price": 3.95, "ingredients": ["flour", "butter"], "options": []}
+  ],
+  "options": {
+    "milk:oat": {"replace": "dairy-milk", "with": "oat-milk"},
+    "milk:almond": {"replace": "dairy-milk", "with": "almond-milk"},
+    "milk:dairy": {"replace": "dairy-milk", "with": "dairy-milk"},
+    "no-cream": {"remove": "whipped-cream"},
+    "no-honey": {"remove": "honey"},
+    "add:butter": {"add": "butter"},
+    "add:vegan-spread": {"add": "vegan-spread"}
+  },
+  "members": [
+    {
+      "id": "zora-vex",
+      "name": "Zora Vex",
+      "stardust": 2310,
+      "rewards": [
+        {"id": "crew-pack", "name": "Crew Pack", "rule": "15% off an order of 6 or more items totalling at least 40 cr", "percentOff": 15, "minItems": 6, "minSubtotal": 40},
+        {"id": "free-drink", "name": "Free drink", "rule": "The most expensive drink in the order is free", "freeDrink": true},
+        {"id": "stardust-600", "name": "600 Stardust", "rule": "Spend 600 Stardust for 6.00 cr off", "creditsOff": 6, "stardustCost": 600}
+      ],
+      "orders": [
+        {
+          "number": "OG-2154",
+          "placedAt": "2026-11-20T12:05:00Z",
+          "cafeId": "titan-ring",
+          "lines": [
+            {"itemId": "comet-cold-brew", "qty": 2, "options": []},
+            {"itemId": "nebula-latte", "qty": 1, "options": ["milk:oat"]},
+            {"itemId": "supernova-mocha", "qty": 1, "options": [], "note": "Mo"},
+            {"itemId": "egg-stardust-wrap", "qty": 2, "options": []},
+            {"itemId": "egg-stardust-wrap", "qty": 1, "options": [], "note": "Mo"},
+            {"itemId": "asteroid-bagel", "qty": 2, "options": []},
+            {"itemId": "zero-g-donut", "qty": 3, "options": []}
+          ]
+        },
+        {
+          "number": "OG-2071",
+          "placedAt": "2026-11-13T08:40:00Z",
+          "cafeId": "ceres-station",
+          "lines": [
+            {"itemId": "nebula-latte", "qty": 1, "options": ["milk:oat"]},
+            {"itemId": "orbit-croissant", "qty": 1, "options": []}
+          ]
+        }
+      ]
+    }
+  ]
+}
