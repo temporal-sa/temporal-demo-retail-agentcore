@@ -10,7 +10,9 @@ with the cart the member saw, and the checkout runs once.
 
 The checkout itself is not up to the model. Once the member pays, this
 Workflow charges, places the order and awards Stardust in that order, each
-with the Workflow ID as the store's Idempotency-Key.
+with the Workflow ID as the store's Idempotency-Key. Then it waits again,
+with nothing running, for the kitchen's ready Signal, and Ziggy tells the
+member the order is ready for pickup.
 
 The UI never sends a Query: Queries need a running Worker, and on AgentCore
 there usually isn't one. It reads the memo, which this Workflow keeps
@@ -39,6 +41,9 @@ with workflow.unsafe.imports_passed_through():
 
 # How long a cart waits for the member. A real app would remind them first.
 PAYMENT_TIMEOUT = timedelta(minutes=30)
+# How long a paid order waits for the kitchen to mark it ready. After that the
+# member picks it up without a message from Ziggy.
+KITCHEN_TIMEOUT = timedelta(minutes=30)
 
 SYSTEM_PROMPT = """You are Ziggy, the ordering assistant in a café chain's app. A member asks you
 to put together an order for pickup. Use your tools; never guess items, prices, stock or rewards.
@@ -76,6 +81,11 @@ class MemberMessage:
 
 
 @dataclass
+class KitchenReady:
+    """The kitchen's ready Signal. It carries nothing: the order is this Workflow."""
+
+
+@dataclass
 class OrderResult:
     phase: str
     order_number: str = ""
@@ -92,6 +102,7 @@ class CrewOrderWorkflow:
     @workflow.init
     def __init__(self, req: OrderRequest) -> None:
         self._inbox: list[Payment | MemberMessage] = []
+        self._ready = False
         self._quote: dict[str, Any] | None = None
         self._memo: dict[str, Any] = {"phase": "planning", "messages": [], "work": [], "quote": None, "order": None}
         # Model calls and tool calls are Activities: the plugin records each
@@ -151,11 +162,25 @@ class CrewOrderWorkflow:
 
         reply = await self._agent.invoke_async(
             f"The member paid {payment['amount']} cr. Order {order['orderNumber']} will be ready at {ready} at {order['cafeName']}. "
-            f"{award['points']} Stardust were added. Tell them in one sentence."
+            f"{award['points']} Stardust were added. Tell them in one sentence, then say you'll let them know when it's ready for pickup."
         )
         self._say("ziggy", str(reply).strip())
-        self._set_phase("placed")
-        return OrderResult(phase="placed", order_number=order["orderNumber"])
+
+        # Another durable wait, this time on the kitchen. The Worker drains
+        # again, and the kitchen's ready Signal starts a new one.
+        self._set_phase("preparing")
+        try:
+            await workflow.wait_condition(lambda: self._ready, timeout=KITCHEN_TIMEOUT)
+        except asyncio.TimeoutError:
+            self._set_phase("placed")
+            return OrderResult(phase="placed", order_number=order["orderNumber"])
+
+        reply = await self._agent.invoke_async(
+            f"The kitchen says order {order['orderNumber']} is ready for pickup at {order['cafeName']}. Tell the member in one sentence."
+        )
+        self._say("ziggy", str(reply).strip())
+        self._set_phase("ready")
+        return OrderResult(phase="ready", order_number=order["orderNumber"])
 
     @workflow.signal
     def pay(self, payment: Payment) -> None:
@@ -177,6 +202,14 @@ class CrewOrderWorkflow:
             workflow.logger.warning("message ignored; Ziggy is not waiting for one")
             return
         self._inbox.append(MemberMessage(text=msg.text[:500]))
+
+    @workflow.signal
+    def kitchen_ready(self, _: KitchenReady) -> None:
+        """The kitchen marked the paid order ready for pickup."""
+        if self._memo["phase"] != "preparing":
+            workflow.logger.warning("ready ignored; the order is not with the kitchen")
+            return
+        self._ready = True
 
     def _say(self, who: str, text: str) -> None:
         if text:

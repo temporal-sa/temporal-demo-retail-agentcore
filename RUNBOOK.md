@@ -28,8 +28,8 @@ It makes three problems visible ([docs/story.md](docs/story.md)):
 ## Start it
 
 Open the demo. A healthy start shows the phone with Zora's request ready to send, Ziggy saying "Send
-the order from the phone to start", the Compute card idle and the Store ledger at zero. The "How
-Temporal runs Ziggy on AgentCore" panel is open; collapse it with **Hide** if the screen is small.
+the order from the phone to start", the Kitchen card with no order, the Compute card idle and the
+Store ledger at zero.
 
 ## The walkthrough
 
@@ -37,7 +37,7 @@ Temporal runs Ziggy on AgentCore" panel is open; collapse it with **Hide** if th
 
 Read the request on the phone aloud, then tap send.
 
-The audience sees "Now: starting a sandbox", then Sandbox 1 running, then Ziggy's checks arrive on
+The audience sees Ziggy "Waking up in a new sandbox", then Sandbox 1 running, then Ziggy's checks arrive on
 the phone and as REST calls in the Tool calls card: order history, menu, stock, rewards, a quote.
 
 Say: "Nothing was running a second ago. Starting the order gave Temporal work, and Temporal Cloud
@@ -70,9 +70,9 @@ read with Describe, not from the agent.
 
 Tap **Pay 48.24 cr**.
 
-"Now: starting a sandbox", Sandbox 2 starts, the Tool calls card adds `POST /payments`, `POST
-/orders` and `POST /members/{member}/stardust` on Sandbox 2, and Ziggy confirms the order number and
-pickup time.
+Sandbox 2 starts, the Tool calls card adds `POST /payments`, `POST /orders` and `POST
+/members/{member}/stardust` on Sandbox 2, and Ziggy confirms the order number and pickup time and
+says "I'll let you know when your order is ready for pickup!"
 
 Say: "That tap was recorded the moment I made it, with nothing running. Recording it started compute
 again. The new sandbox replayed the history, so the agent had the same cart without asking the model
@@ -81,7 +81,21 @@ to redo its work. Only the payment, the order and one reply ran."
 Proof: Model calls went up by one, and "repeated after resume" is 0. The Store ledger shows one card
 charge for 48.24 cr and "charged twice: 0". Open **Open in Temporal UI** for the full history.
 
-### 5. Optional: ask for a change before paying
+### 5. The kitchen marks it ready: another new sandbox
+
+The Kitchen card shows the order as **Preparing**. Wait about a minute until the Compute card shows
+**No sandbox running** again, then click **Mark order ready**.
+
+Sandbox 3 starts, and Ziggy tells the member on the phone that the order is ready for pickup.
+
+Say: "Ziggy promised to message the member when the order was ready, and then nothing ran while the
+kitchen worked. The kitchen's click was another Signal. It started a new sandbox, which picked up
+right after the promise and kept it."
+
+Proof: the Event History shows `Signal received · kitchen_ready`, and Model calls went up by one
+more. The Store ledger still shows one charge.
+
+### 6. Optional: ask for a change before paying
 
 On a new order, instead of paying, type "add two more donuts" and send. Locally the stub model says
 it can only build the scripted order; with Bedrock, Ziggy reprices the cart and Pay uses the new
@@ -96,7 +110,7 @@ Line links point at paths on `main` until the first commit; replace them with co
 
 **When:** "What did it take to make the agent durable?"
 
-**Where:** [`agent/crew/workflows.py:99-111`](agent/crew/workflows.py#L99-L111) (`code -g agent/crew/workflows.py:99`)
+**Where:** [`agent/crew/workflows.py:110-122`](agent/crew/workflows.py#L110-L122) (`code -g agent/crew/workflows.py:110`)
 
 ```python
 self._agent = TemporalAgent(
@@ -119,9 +133,9 @@ client lives on the Worker, never in the Workflow. Docs:
 
 ### Wait for the member with nothing running
 
-**When:** beat 3, "what is running while it waits?"
+**When:** beats 3 and 5, "what is running while it waits?"
 
-**Where:** [`agent/crew/workflows.py:123-136`](agent/crew/workflows.py#L123-L136) and the Signal at [`160-171`](agent/crew/workflows.py#L160-L171) (`code -g agent/crew/workflows.py:123`)
+**Where:** [`agent/crew/workflows.py:134-147`](agent/crew/workflows.py#L134-L147) and the Signal at [`185-196`](agent/crew/workflows.py#L185-L196); the kitchen's wait at [`169-176`](agent/crew/workflows.py#L169-L176) and its Signal at [`206-212`](agent/crew/workflows.py#L206-L212) (`code -g agent/crew/workflows.py:134`)
 
 ```python
 while True:
@@ -142,13 +156,14 @@ while True:
 end the session, and the `pay` Signal brings a new Worker back to this line. A Signal, not an
 Update, because the server records it at once with no Worker running, and recording it is what
 makes Temporal Cloud invoke one. The phone reads the cart from the memo (`_set_phase`), never with a
-Query.
+Query. The wait for the kitchen is the same pattern: `wait_condition` on a flag that the
+`kitchen_ready` Signal sets.
 
 ### Charge exactly once
 
 **When:** beat 4, "what stops a double charge?"
 
-**Where:** [`agent/crew/workflows.py:138-150`](agent/crew/workflows.py#L138-L150) and the store's [`store/internal/store/ledger.go:58-90`](store/internal/store/ledger.go#L58-L90) (`code -g agent/crew/workflows.py:138`)
+**Where:** [`agent/crew/workflows.py:149-161`](agent/crew/workflows.py#L149-L161) and the store's [`store/internal/store/ledger.go:58-90`](store/internal/store/ledger.go#L58-L90) (`code -g agent/crew/workflows.py:149`)
 
 ```python
 key = workflow.info().workflow_id

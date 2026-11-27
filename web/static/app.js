@@ -8,7 +8,7 @@ const FAST_POLL_MS = 1000;
 const SLOW_POLL_MS = 4000;
 
 const $ = (id) => document.getElementById(id);
-const state = { orderId: new URLSearchParams(location.search).get("order"), view: null, pending: null, paying: false, sending: false, timer: null };
+const state = { orderId: new URLSearchParams(location.search).get("order"), view: null, pending: null, paying: false, sending: false, marking: false, timer: null };
 
 // ---------- small DOM helpers ----------
 function el(tag, attrs = {}, ...children) {
@@ -71,6 +71,7 @@ async function poll() {
 function setOrder(id) {
   state.orderId = id;
   state.paying = false;
+  state.marking = false;
   const url = new URL(location.href);
   if (id) url.searchParams.set("order", id);
   else url.searchParams.delete("order");
@@ -109,6 +110,19 @@ async function pay(quoteId) {
   poll();
 }
 
+async function markReady() {
+  state.marking = true;
+  render();
+  try {
+    await api("POST", `/api/orders/${state.orderId}/ready`, {});
+  } catch (err) {
+    state.marking = false;
+    $("error-text").textContent = `Ready not sent: ${err.message}`;
+    $("error-banner").hidden = false;
+  }
+  poll();
+}
+
 async function sendMessage(text) {
   state.sending = true;
   render();
@@ -127,12 +141,17 @@ async function sendMessage(text) {
 function moment(view, o) {
   if (!o) return "none";
   const running = view?.worker?.running;
-  if (o.phase === "placed") return running ? "done-draining" : "done";
+  if (o.phase === "ready" || o.phase === "placed") return running ? "done-draining" : "done";
   if (o.phase === "expired" || o.status !== "Running") return "closed";
   if (o.phase === "confirm" || o.phase === "chat") return running ? "draining" : "waiting";
+  if (o.phase === "preparing" && !kitchenSignaled(o)) return running ? "kitchen-draining" : "kitchen";
   if (!running) return "invoking";
   return "working";
 }
+
+// The kitchen marked the order ready: the Signal is in the history, and
+// Ziggy's message about it follows once a Worker picks it up.
+const kitchenSignaled = (o) => (o?.proof?.rows || []).some((r) => r.kind === "signal" && r.name === "kitchen_ready");
 
 function sandboxes(view, o) {
   const workers = o?.proof?.workers || [];
@@ -154,8 +173,8 @@ function render() {
   const m = moment(view, o);
   renderHeader(view, o);
   renderPhone(view, o, m);
-  renderHow(view, o, m);
   renderAgent(view, o, m);
+  renderKitchen(view, o, m);
   renderBackstage(view, o, m);
 }
 
@@ -199,7 +218,7 @@ function renderPhone(view, o, m) {
       items.push(t.msg.from === "member" ? el("div", { class: "bubble me", text: t.msg.text }) : zigLine(t.msg.text));
       if (i === cartAfter && o.quote) items.push(cart(o));
     });
-    if (["planning", "placing"].includes(o.phase) && o.status === "Running") items.push(zigLine(null));
+    if (o.status === "Running" && (["planning", "placing"].includes(o.phase) || (o.phase === "preparing" && kitchenSignaled(o)))) items.push(zigLine(null));
   }
   chat.replaceChildren(...items);
   chat.scrollTop = chat.scrollHeight;
@@ -210,7 +229,7 @@ function renderPhone(view, o, m) {
   text.disabled = !(canStart || canMessage);
   $("composer-send").disabled = text.disabled;
   if (canStart && !text.value && !text.dataset.touched) text.value = DEFAULT_REQUEST;
-  text.placeholder = canMessage ? "Ask for a change" : o?.phase === "placed" ? "Order placed" : "Ziggy is working";
+  text.placeholder = canMessage ? "Ask for a change" : { preparing: "Ziggy will message you when it's ready", ready: "Ready for pickup", placed: "Order placed" }[o?.phase] || "Ziggy is working";
   if (o && text.value === DEFAULT_REQUEST) text.value = "";
 
   $("phone-caption").textContent = {
@@ -219,8 +238,10 @@ function renderPhone(view, o, m) {
     working: "Ziggy is working out the order.",
     draining: "Wait about a minute before tapping Pay: the sandbox drains, then AgentCore ends it.",
     waiting: "No sandbox is running. Tapping Pay starts a new one.",
-    "done-draining": "Paid once, placed once.",
-    done: "Paid once, placed once.",
+    "kitchen-draining": "Paid once, placed once. Wait about a minute before marking it ready: the sandbox drains, then AgentCore ends it.",
+    kitchen: "No sandbox is running. Marking the order ready in the kitchen starts a new one.",
+    "done-draining": o?.phase === "ready" ? "Paid once, placed once, ready for pickup." : "Paid once, placed once.",
+    done: o?.phase === "ready" ? "Paid once, placed once, ready for pickup." : "Paid once, placed once.",
     closed: "This order is closed. Start a new one.",
   }[m];
 }
@@ -260,60 +281,6 @@ function cart(o) {
   return el("div", { class: "cart", "aria-label": "Cart" }, rows, reward, total, action);
 }
 
-const FLOW = [
-  { kind: "Temporal Cloud", name: "CrewOrderWorkflow" },
-  { kind: "AgentCore endpoint", name: "Serverless Worker" },
-  { kind: "AgentCore sandbox", name: "Sandbox" },
-  { kind: "Activity", name: "Bedrock · Claude Sonnet 5.5" },
-  { kind: "Activity → REST", name: "Store API (mock)" },
-];
-
-function renderHow(view, o, m) {
-  const local = view.workerLocation === "local";
-  const live = sandboxes(view, o).find((s) => s.live);
-  const liveName = live ? `Sandbox ${live.n}` : "Sandbox";
-  const model = o?.model && o.model.startsWith("stub") ? "Stub model (offline)" : "Bedrock · Claude Sonnet 5.5";
-  const lit = {
-    none: [0, 0, 0, 0, 0], invoking: [1, 1, 0, 0, 0], working: [1, 1, 1, 1, 1], draining: [1, 0, 1, 0, 0],
-    waiting: [1, 0, 0, 0, 0], "done-draining": [1, 0, 1, 0, 0], done: [1, 0, 0, 0, 0], closed: [1, 0, 0, 0, 0],
-  }[m];
-  const notes = [
-    m === "waiting" ? "Holds the cart, every model answer and tool result. Waits on a Signal" : "Event History records every step",
-    m === "invoking" ? (local ? "The local invoker stands in for Temporal Cloud here" : "Temporal Cloud is invoking it: tasks wait and no Worker polls") : "Invoked when tasks wait and no Worker polls",
-    live ? "Temporal Worker + Strands agent, empty on start" : "No sandbox running",
-    "Each model call is an Activity",
-    "Stateless: menus, stock, rewards, payments, orders",
-  ];
-  const status = ["waiting", "active", "active", "active", "active"];
-  if (m !== "waiting" && m !== "none") status[0] = "completed";
-  $("flow").replaceChildren(...FLOW.map((n, i) =>
-    el("li", {},
-      el("div", { class: "flow-node", "data-status": status[i], "data-lit": lit[i] ? "true" : "false" },
-        el("span", { class: "eyebrow", text: n.kind }),
-        el("span", { class: "name", text: i === 2 ? (live ? liveName : "No sandbox") : i === 3 ? model : n.name }),
-        el("span", { class: "note", text: notes[i] })),
-      i < FLOW.length - 1 ? el("span", { class: "flow-arrow", "aria-hidden": "true", "data-lit": lit[i] && lit[i + 1] ? "true" : "false", text: i === 2 ? "+" : "→" }) : null)));
-
-  const debounce = local ? "about 20 seconds" : "30 seconds";
-  const how = {
-    none: { badge: ["pending", "no order yet"], steps: [["The phone", "starts a CrewOrderWorkflow on Temporal Cloud. Nothing else runs yet."], ["Temporal", "sees a task with no Worker polling and invokes the AgentCore endpoint."], ["AgentCore", "starts a sandbox, which runs a Temporal Worker and the Strands agent."]], callout: ["pending", "Watch for", "The sandbox ending while the member looks at the cart, and a new one finishing the order without repeating anything."] },
-    invoking: { badge: ["active", "starting a sandbox"], steps: [["Temporal", "has a task on the Task Queue and no Worker polling it."], [local ? "The local invoker" : "Temporal Cloud", "invokes the AgentCore endpoint, and AgentCore starts a sandbox."], ["The sandbox", "starts with an empty process and a Temporal Worker that polls for the task."]], callout: ["active", "Why a new sandbox can pick up", "Nothing about the order lives in the sandbox. The Event History on Temporal Cloud has all of it."] },
-    working: { badge: ["active", `${liveName} is working`], steps: [["The Strands agent", "decides which tools to call. Every model call and tool call is an Activity in the sandbox."], ["Each tool Activity", "is one request to the store API: order history, menu, stock, rewards, a quote."], ["Temporal", "writes every model answer and tool result to the Event History as it completes."]], callout: ["active", "Where the state lives", "In the Event History on Temporal Cloud, not in the sandbox. The sandbox only holds the step in progress."] },
-    draining: { badge: ["waiting", `${liveName} is idle`], steps: [["The Workflow", "showed the cart through its memo and waits for the pay Signal. It has no tasks to hand out."], ["The Worker", `sees no Activity for ${debounce}, drains and releases the session.`], ["AgentCore", "then ends the idle sandbox. Wait for it before tapping Pay."]], callout: ["waiting", "What is kept", "Every model answer, every tool result and the priced cart, in the Event History."] },
-    waiting: { badge: ["waiting", "waiting for the member, no sandbox"], steps: [["The Workflow", "is waiting for the pay Signal. It has no tasks to hand out."], ["The Worker", "drained, and AgentCore ended the sandbox."], ["Nothing", "is running, and nothing is billed, however long the member takes."]], callout: ["waiting", "What is kept", "The model's answers, the tool results and the priced cart. Run the agent again from scratch and it could build a different cart from the one on the phone."] },
-    "done-draining": null,
-    done: { badge: ["completed", `order placed by ${liveName === "Sandbox" ? "a new sandbox" : liveName}`], steps: [["The pay Signal", "created a task, and Temporal invoked the AgentCore endpoint again. AgentCore started a new sandbox, a process with no memory."], ["The Worker", "replayed the Event History. Model calls and store reads returned their recorded results, so the agent carried on with the same cart without asking the model again."], ["Only new work ran", "the payment, the order and the Stardust, each sent with the order as its Idempotency-Key, then one model call for the reply."]], callout: ["completed", "Why the card was charged once", "History stops a finished step from running again. The Idempotency-Key covers the one gap left: a sandbox lost mid-call after the store took the payment."] },
-    closed: { badge: ["skipped", "order closed"], steps: [["The order", "ended without a payment."], ["Nothing", "was charged."], ["Start", "a new order from the phone."]], callout: ["skipped", "Closed", "Orders wait 30 minutes for the member."] },
-  };
-  const h = how[m] || how.done;
-  $("how-badge").dataset.status = h.badge[0];
-  $("how-badge").textContent = `Now: ${h.badge[1]}`;
-  $("how-steps").replaceChildren(...h.steps.map(([who, what]) => el("li", {}, el("strong", { text: who }), ` ${what}`)));
-  $("how-callout").dataset.status = h.callout[0];
-  $("how-callout-title").textContent = h.callout[1];
-  $("how-callout-text").textContent = h.callout[2];
-}
-
 const ENDPOINTS = {
   get_recent_orders: "GET /members/{member}/orders",
   get_menu: "GET /cafes/{cafe}/menu",
@@ -333,14 +300,18 @@ function renderAgent(view, o, m) {
   const signals = (o?.proof?.rows || []).filter((r) => r.kind === "signal");
   const paidAt = signals.find((r) => r.name === "pay")?.at;
   const placedBy = (o?.proof?.rows || []).find((r) => r.name === "charge_payment")?.worker;
+  const placed = ["preparing", "ready", "placed"].includes(phase);
+  const readyAt = signals.find((r) => r.name === "kitchen_ready")?.at;
   const step = (status, label, detail, time) => ({ status, label, detail, time });
   const steps = [
     step(work.length ? "completed" : o ? "active" : "pending", "Understand the request", o ? "Repeat an order · dietary needs · best reward" : "", ""),
     step(done("get_stock") ? "completed" : work.length ? "active" : "pending", "Rebuild the order for today", done("get_stock") ? "History, menu and stock read from the store" : work.length ? "Reading the store" : "", ""),
     step(quoted ? "completed" : done("get_rewards") ? "active" : "pending", "Price the cart, pick the best reward", quoted ? (o.quote.reward ? `${o.quote.reward.name} saves ${money(o.quote.reward.discount)} cr` : `Total ${money(o.quote.total)} cr`) : "", ""),
     step(phase === "confirm" || phase === "chat" ? "waiting" : paidAt ? "completed" : "pending", "The member confirms the cart", phase === "confirm" ? "Waiting on the member · as long as it takes" : paidAt ? "Paid" : "", phase === "confirm" && view.serverTime && o.messages.length ? ago(o.messages[o.messages.length - 1].at, view.serverTime) : clock(paidAt)),
-    step(phase === "placed" ? "completed" : phase === "placing" ? "active" : "pending", "Charge, place, award Stardust", phase === "placed" ? `${sandboxName(o, placedBy)} · nothing before it ran again` : phase === "placing" || phase === "confirm" ? "Runs on a new sandbox" : "", ""),
-    step(phase === "placed" ? "completed" : "pending", "Tell the member", phase === "placed" && o.placed ? `Ready ${o.placed.ready} · ${o.placed.points} Stardust` : "", ""),
+    step(placed ? "completed" : phase === "placing" ? "active" : "pending", "Charge, place, award Stardust", placed ? `${sandboxName(o, placedBy)} · nothing before it ran again` : phase === "placing" || phase === "confirm" ? "Runs on a new sandbox" : "", ""),
+    step(placed ? "completed" : "pending", "Tell the member it's placed", placed && o.placed ? `Ready ${o.placed.ready} · ${o.placed.points} Stardust` : "", ""),
+    step(phase === "preparing" ? (readyAt ? "completed" : "waiting") : phase === "ready" ? "completed" : "pending", "The kitchen makes the order", phase === "preparing" && !readyAt ? "Waiting on the kitchen · no sandbox needed" : readyAt ? "Marked ready" : phase === "placed" ? "Not marked ready in time" : "", phase === "preparing" && !readyAt && view.serverTime && o.messages.length ? ago(o.messages[o.messages.length - 1].at, view.serverTime) : clock(readyAt)),
+    step(phase === "ready" ? "completed" : readyAt ? "active" : "pending", "Tell the member it's ready", phase === "ready" ? "Ready for pickup" : readyAt ? "Runs on a new sandbox" : "", ""),
   ];
   $("steps").replaceChildren(...steps.map((s, i) =>
     el("li", { class: "step", "data-status": s.status },
@@ -349,18 +320,21 @@ function renderAgent(view, o, m) {
       s.detail ? el("span", { class: s.status === "waiting" ? "step-note" : "step-detail", text: s.detail }) : null,
       el("span", { class: "step-time", text: s.time }))));
 
-  const badge = { none: ["pending", "Ready"], invoking: ["active", "Starting"], working: ["active", "Working"], draining: ["waiting", "Waiting for the member"], waiting: ["waiting", "Waiting for the member"], "done-draining": ["completed", "Ordered"], done: ["completed", "Ordered"], closed: ["skipped", "Closed"] }[m];
+  const doneLabel = phase === "ready" ? "Ready for pickup" : "Ordered";
+  const badge = { none: ["pending", "Ready"], invoking: ["active", "Starting"], working: ["active", "Working"], draining: ["waiting", "Waiting for the member"], waiting: ["waiting", "Waiting for the member"], "kitchen-draining": ["waiting", "Waiting for the kitchen"], kitchen: ["waiting", "Waiting for the kitchen"], "done-draining": ["completed", doneLabel], done: ["completed", doneLabel], closed: ["skipped", "Closed"] }[m];
   $("agent-badge").dataset.status = badge[0];
   $("agent-badge").textContent = badge[1];
-  $("zig-stage").dataset.phase = m === "working" || m === "invoking" ? "busy" : m === "waiting" ? "paused" : "idle";
+  $("zig-stage").dataset.phase = m === "working" || m === "invoking" ? "busy" : m === "waiting" || m === "kitchen" ? "paused" : "idle";
   $("speech").textContent = {
     none: "Send the order from the phone to start.",
     invoking: "Waking up in a new sandbox.",
-    working: "Reading the order history, menu, stock and rewards.",
+    working: { placing: "Charging the card and placing the order.", preparing: "Telling the member their order is ready." }[phase] || "Reading the order history, menu, stock and rewards.",
     draining: "Cart's ready. When my sandbox goes idle, AgentCore ends it.",
     waiting: "My sandbox ended. Paying starts a new one, and I pick up right here.",
-    "done-draining": `Charged once, ordered once${o?.placed ? `, ${o.placed.points} Stardust posted` : ""}. Back to orbit.`,
-    done: `Charged once, ordered once${o?.placed ? `, ${o.placed.points} Stardust posted` : ""}. Back to orbit.`,
+    "kitchen-draining": "Order's in. When my sandbox goes idle, AgentCore ends it.",
+    kitchen: "My sandbox ended. When the kitchen marks the order ready, a new one tells the member.",
+    "done-draining": phase === "ready" ? "Charged once, ordered once, and the member knows it's ready. Back to orbit." : `Charged once, ordered once${o?.placed ? `, ${o.placed.points} Stardust posted` : ""}. Back to orbit.`,
+    done: phase === "ready" ? "Charged once, ordered once, and the member knows it's ready. Back to orbit." : `Charged once, ordered once${o?.placed ? `, ${o.placed.points} Stardust posted` : ""}. Back to orbit.`,
     closed: "That order closed without a payment.",
   }[m];
   $("model-line").textContent = o?.model ? (o.model.startsWith("stub") ? "stub model, offline" : o.model) : "model";
@@ -384,7 +358,28 @@ function renderAgent(view, o, m) {
   });
   if (!items.length) items.push(el("li", { class: "empty-row", text: o ? "No tool calls yet." : "Ziggy's requests to the store API show here." }));
   if (o && ["confirm", "chat"].includes(phase)) items.push(el("li", { class: "empty-row", text: "Payment, order and Stardust run after the member pays." }));
+  if (phase === "preparing" && !readyAt) items.push(el("li", { class: "empty-row", text: "Ziggy messages the member when the kitchen marks the order ready." }));
   $("tools").replaceChildren(...items);
+}
+
+function renderKitchen(view, o, m) {
+  $("kitchen-title").textContent = view.profile ? `Kitchen · ${view.profile.cafe}` : "Kitchen";
+  const marked = kitchenSignaled(o);
+  if (o?.phase !== "preparing" || marked) state.marking = false;
+  const number = o?.placed?.orderNumber;
+  const [status, label, text] =
+    o?.phase === "ready" ? ["completed", "Ready", `Order ${number} is ready. Ziggy told the member.`]
+    : o?.phase === "preparing" && marked ? ["active", "Marked ready", `Order ${number} is ready. Ziggy is telling the member.`]
+    : o?.phase === "preparing" ? ["waiting", "Preparing", `Order ${number} is on the line, ready about ${o.placed.ready}. Mark it ready when it's done.`]
+    : o?.phase === "placing" ? ["active", "Incoming", "A paid order is on its way."]
+    : o?.phase === "placed" ? ["skipped", "Not marked", `Order ${number} was not marked ready in time.`]
+    : ["pending", o ? "No paid order" : "No order", "Paid orders show here."];
+  $("kitchen-badge").dataset.status = status;
+  $("kitchen-badge").textContent = label;
+  $("kitchen-text").textContent = text;
+  const btn = $("kitchen-ready");
+  btn.disabled = !(o?.phase === "preparing" && o.status === "Running" && !marked && !state.marking);
+  btn.textContent = state.marking ? "Marking ready…" : marked || o?.phase === "ready" ? "Marked ready" : "Mark order ready";
 }
 
 function renderBackstage(view, o, m) {
@@ -403,9 +398,11 @@ function renderBackstage(view, o, m) {
   const running = view?.worker?.running;
   $("compute-badge").className = `badge ${running ? "good" : "idle"}`;
   $("compute-badge").textContent = running ? "1 running" : "Idle · 0 running";
-  const showBanner = m === "waiting";
+  const showBanner = m === "waiting" || m === "kitchen";
   $("no-sandbox").hidden = !showBanner;
-  if (showBanner) $("no-sandbox-text").textContent = `${list.length ? `Sandbox ${list[list.length - 1].n}` : "The sandbox"} drained while the member looked at the cart, and AgentCore ended it. Nothing runs or bills now. Tapping Pay starts a new one.`;
+  const last = list.length ? `Sandbox ${list[list.length - 1].n}` : "The sandbox";
+  if (m === "waiting") $("no-sandbox-text").textContent = `${last} drained while the member looked at the cart, and AgentCore ended it. Nothing runs or bills now. Tapping Pay starts a new one.`;
+  if (m === "kitchen") $("no-sandbox-text").textContent = `${last} drained while the kitchen makes the order, and AgentCore ended it. Nothing runs or bills now. Marking the order ready starts a new one.`;
 
   const entries = o?.ledger?.entries || [];
   const count = (kind) => entries.filter((e) => e.kind === kind).length;
@@ -432,6 +429,7 @@ function renderBackstage(view, o, m) {
     const [t, status] = text(r);
     return el("li", { "data-status": status === "pending" ? "pending" : status === "failed" ? "retrying" : status }, el("time", { text: clock(r.at) }), el("span", { text: t }));
   });
+  if (o && m === "kitchen") events.push(el("li", { "data-status": "waiting" }, el("time", { text: clock(view.serverTime) }), el("span", { text: "Waiting for Signal · kitchen_ready · no sandbox" })));
   if (o && m === "waiting") events.push(el("li", { "data-status": "waiting" }, el("time", { text: clock(view.serverTime) }), el("span", { text: "Waiting for Signal · pay · no sandbox" })));
   if (!events.length) events.push(el("li", {}, el("time", { text: "" }), el("span", { text: "No history yet." })));
   $("events").replaceChildren(...events);
@@ -466,6 +464,7 @@ document.addEventListener("DOMContentLoaded", () => {
     if (!state.view?.order && !state.pending) startOrder(value);
     else sendMessage(value);
   });
+  $("kitchen-ready").addEventListener("click", markReady);
   $("new-order").addEventListener("click", () => {
     setOrder(null);
     state.view = { ...state.view, order: null };

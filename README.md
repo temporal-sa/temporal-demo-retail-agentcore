@@ -75,7 +75,11 @@ sequenceDiagram
   t->>w: ⑦ Invoke a new Worker
   w->>t: Poll, replay history,<br/>same cart, no model call
   w->>s: ⑧ Payment, order, Stardust<br/>Idempotency-Key = Workflow ID
-  w->>t: Workflow completes
+  w->>t: "I'll let you know when it's ready",<br/>wait for a Signal
+  Note over w: ⑨ Idle again: AgentCore ends the session
+  api->>t: ⑩ Kitchen marks it ready: Signal kitchen_ready
+  t->>w: Invoke a new Worker
+  w->>t: ⑪ "Ready for pickup", Workflow completes
   end
 ```
 
@@ -90,7 +94,12 @@ sequenceDiagram
 7. Temporal invokes a new Worker, which replays the history. The model's answers and the store's
    reads come back from the history, so the agent has the same cart without calling the model.
 8. The Workflow charges the card, places the order and posts the Stardust, each an Activity that
-   sends the Workflow ID as its Idempotency-Key, and Ziggy tells the member.
+   sends the Workflow ID as its Idempotency-Key. Ziggy tells the member, and says it will let them
+   know when the order is ready for pickup.
+9. The Workflow waits for the kitchen. The Worker drains again and AgentCore ends the session.
+10. The kitchen marks the order ready, and the API sends the `kitchen_ready` Signal.
+11. Temporal invokes a new Worker, which replays the history, and Ziggy tells the member the order
+    is ready for pickup.
 
 **From Strands Agents:** the agent itself. The system prompt, the tool definitions (built from the
 tool functions' docstrings), the model loop that decides which tool to call next, and the Bedrock
@@ -111,7 +120,7 @@ orders and Stardust written once per Idempotency-Key to DynamoDB.
 
 | Path | What |
 |---|---|
-| `agent/crew/workflows.py` | The order Workflow: the agent, the wait for the member, checkout |
+| `agent/crew/workflows.py` | The order Workflow: the agent, the wait for the member, checkout, the wait for the kitchen |
 | `agent/crew/activities.py` | The tools and checkout steps, each one request to the store |
 | `agent/crew/models.py` | Bedrock, or a scripted stub for offline runs |
 | `agent/agentcore_worker.py` | The AgentCore entrypoint that starts and drains the Worker |

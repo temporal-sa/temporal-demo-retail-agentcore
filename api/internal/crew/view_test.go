@@ -60,6 +60,9 @@ func TestBuildProofCountsEachCallOnceAndNamesBothWorkers(t *testing.T) {
 	if kinds["checkout"] != 1 || kinds["signal"] != 1 || kinds["worker"] != 2 {
 		t.Fatalf("rows by kind %v", kinds)
 	}
+	if p.LastWorker != "ziggy@b" {
+		t.Fatalf("last worker %q", p.LastWorker)
+	}
 }
 
 func TestLoadConfigListsEveryProblem(t *testing.T) {

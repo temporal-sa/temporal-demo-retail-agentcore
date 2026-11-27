@@ -33,20 +33,6 @@
 
   <div class="state-banner is-error" id="error-banner" role="alert" hidden><strong>Can't reach the demo's API</strong><span id="error-text">Retrying.</span></div>
 
-  <details class="card how" id="how" open>
-    <summary>
-      <span class="how-title"><span class="eyebrow">How it works · follows the run</span><span class="heading">How Temporal runs Ziggy on AgentCore</span></span>
-      <span class="status-badge" id="how-badge" data-status="pending">Now: no order yet</span>
-    </summary>
-    <div class="how-body">
-      <ol class="flow" id="flow" aria-label="Where the work runs"></ol>
-      <div class="how-text">
-        <ol id="how-steps"></ol>
-        <div class="callout" id="how-callout" data-status="pending"><p class="eyebrow" id="how-callout-title"></p><p id="how-callout-text"></p></div>
-      </div>
-    </div>
-  </details>
-
   <main class="columns">
     <section class="phone-col" aria-label="The member's phone">
       <div class="phone-stage" id="phone-stage">
@@ -88,6 +74,11 @@
     </section>
 
     <aside class="backstage-col">
+      <section class="card stack-10" aria-label="The kitchen">
+        <div class="card-head"><h2 class="heading" id="kitchen-title">Kitchen</h2><span class="status-badge" id="kitchen-badge" data-status="pending">No order</span></div>
+        <p class="muted kitchen-text" id="kitchen-text">Paid orders show here.</p>
+        <button type="button" class="button small primary green" id="kitchen-ready" disabled>Mark order ready</button>
+      </section>
       <section class="card stack-10">
         <div class="card-head"><h2 class="heading">Compute · AgentCore sandboxes</h2><span class="badge idle" id="compute-badge">Idle</span></div>
         <div class="state-banner" id="no-sandbox" hidden><strong>No sandbox running</strong><span id="no-sandbox-text"></span></div>

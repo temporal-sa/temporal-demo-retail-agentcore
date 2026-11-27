@@ -25,7 +25,7 @@ from temporalio.worker import Worker
 
 from crew import activities
 from crew.models import MODEL_NAME, StubModel
-from crew.workflows import CrewOrderWorkflow, MemberMessage, OrderRequest, OrderResult, Payment
+from crew.workflows import CrewOrderWorkflow, KitchenReady, MemberMessage, OrderRequest, OrderResult, Payment
 
 TASK_QUEUE = "crew-test"
 # The store's own skin, so the fake answers with the same cafés, menu and
@@ -146,7 +146,7 @@ async def activity_attempts(handle: WorkflowHandle) -> tuple[Counter[str], list[
     return calls, identities
 
 
-async def test_builds_the_cart_waits_and_a_new_worker_checks_out_once(env: WorkflowEnvironment, store: FakeStore):
+async def test_builds_the_cart_waits_checks_out_once_and_waits_for_the_kitchen(env: WorkflowEnvironment, store: FakeStore):
     async with worker(env.client, "sandbox-1"):
         handle = await start(env.client)
         m = await wait_for_phase(env, handle, "confirm")
@@ -160,19 +160,29 @@ async def test_builds_the_cart_waits_and_a_new_worker_checks_out_once(env: Workf
 
     await handle.signal(CrewOrderWorkflow.pay, Payment(quote_id=m["quote"]["quoteId"]))
     async with worker(env.client, "sandbox-2"):
+        m = await wait_for_phase(env, handle, "preparing")
+    assert "ready for pickup" in m["messages"][-1]["text"]
+    placed, _ = await activity_attempts(handle)
+
+    # Sandbox 2 is gone too. The kitchen's Signal brings up sandbox 3.
+    await handle.signal(CrewOrderWorkflow.kitchen_ready, KitchenReady())
+    async with worker(env.client, "sandbox-3"):
         result = await handle.result()
 
-    assert result.phase == "placed" and result.order_number == "OG-4242"
+    assert result.phase == "ready" and result.order_number == "OG-4242"
     calls, identities = await activity_attempts(handle)
-    assert identities == ["sandbox-1", "sandbox-2"]
+    assert identities == ["sandbox-1", "sandbox-2", "sandbox-3"]
     # Every Activity ran once, on one attempt. Sandbox 2 added the checkout
-    # and one model call for the reply, and repeated nothing from sandbox 1.
+    # and one model call for the reply, sandbox 3 one model call for the
+    # pickup message, and neither repeated anything before it.
     assert all(n == 1 for name, n in calls.items() if name != "invoke_model"), calls
-    assert calls["invoke_model"] == before["invoke_model"] + 1
+    assert placed["invoke_model"] == before["invoke_model"] + 1
+    assert calls["invoke_model"] == before["invoke_model"] + 2
     assert {k: v for k, v in calls.items() if k in ("charge_payment", "place_order", "award_stardust")} == {"charge_payment": 1, "place_order": 1, "award_stardust": 1}
     assert all(n == 1 for n in store.writes.values()), store.writes
     final = await memo(handle)
     assert final["order"]["orderNumber"] == "OG-4242" and final["messages"][-1]["from"] == "ziggy"
+    assert "ready for pickup" in final["messages"][-1]["text"]
 
 
 async def test_a_stale_payment_is_ignored_and_a_message_gets_a_reply(env: WorkflowEnvironment, store: FakeStore):

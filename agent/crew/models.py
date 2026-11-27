@@ -135,7 +135,14 @@ def next_step(messages: Messages) -> tuple[str, tuple[str, dict[str, Any]] | Non
         paid = re.search(r"Order (\S+) will be ready at (\S+) at ([^.]+)\. (\d+) Stardust", _text(last))
         if paid:
             number, ready, cafe_name, points = paid.groups()
-            return f"Order {number} is in. {cafe_name} has it ready at {ready}, and {points} Stardust are on your account.", None
+            return (
+                f"Order {number} is in. {cafe_name} has it ready at {ready}, and {points} Stardust are on your account. "
+                "I'll let you know when your order is ready for pickup!"
+            ), None
+        pickup = re.search(r"order (\S+) is ready for pickup at ([^.]+)\.", _text(last))
+        if pickup:
+            number, cafe_name = pickup.groups()
+            return f"Order {number} is ready for pickup at {cafe_name}. Enjoy, crew!", None
         return "I'm the offline stand-in model, so I can only build the order I was scripted for. Tap Pay, or start a new order.", None
 
     done = _tool_results(messages)

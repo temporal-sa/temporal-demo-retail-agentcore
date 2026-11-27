@@ -64,6 +64,11 @@ type Proof struct {
 	Repeats int      `json:"repeats"`
 	Workers []string `json:"workers"`
 	Events  int      `json:"events"`
+	// LastWorker is the Worker that most recently started or finished a
+	// task, at LastWorkerAt. A Worker can finish its work before its first
+	// heartbeat; this is how the view still knows it is there.
+	LastWorker   string    `json:"-"`
+	LastWorkerAt time.Time `json:"-"`
 }
 
 // ProofRow is one call or one moment worth naming in the history.
@@ -149,11 +154,19 @@ func buildProof(events []*historypb.HistoryEvent) *Proof {
 		p.Rows = append(p.Rows, ProofRow{Kind: "worker", Name: identity, Status: "completed", At: at})
 		lastWorker = identity
 	}
+	touch := func(identity string, at time.Time) {
+		if identity != "" {
+			p.LastWorker, p.LastWorkerAt = identity, at
+		}
+	}
 	for _, e := range events {
 		at := e.GetEventTime().AsTime()
 		switch e.GetEventType() {
 		case enumspb.EVENT_TYPE_WORKFLOW_TASK_STARTED:
 			noteWorker(e.GetWorkflowTaskStartedEventAttributes().GetIdentity(), at)
+			touch(e.GetWorkflowTaskStartedEventAttributes().GetIdentity(), at)
+		case enumspb.EVENT_TYPE_WORKFLOW_TASK_COMPLETED:
+			touch(e.GetWorkflowTaskCompletedEventAttributes().GetIdentity(), at)
 		case enumspb.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED:
 			name := e.GetActivityTaskScheduledEventAttributes().GetActivityType().GetName()
 			kind, known := activityKinds[name]
@@ -169,6 +182,7 @@ func buildProof(events []*historypb.HistoryEvent) *Proof {
 			p.Rows = append(p.Rows, ProofRow{Kind: kind, Name: name, Status: "pending", At: at})
 		case enumspb.EVENT_TYPE_ACTIVITY_TASK_STARTED:
 			a := e.GetActivityTaskStartedEventAttributes()
+			touch(a.GetIdentity(), at)
 			if i, ok := scheduled[a.GetScheduledEventId()]; ok {
 				noteWorker(a.GetIdentity(), at)
 				p.Rows[i].Worker = a.GetIdentity()
@@ -179,6 +193,7 @@ func buildProof(events []*historypb.HistoryEvent) *Proof {
 				}
 			}
 		case enumspb.EVENT_TYPE_ACTIVITY_TASK_COMPLETED:
+			touch(e.GetActivityTaskCompletedEventAttributes().GetIdentity(), at)
 			finish(p, scheduled, e.GetActivityTaskCompletedEventAttributes().GetScheduledEventId(), "completed", at)
 		case enumspb.EVENT_TYPE_ACTIVITY_TASK_FAILED:
 			finish(p, scheduled, e.GetActivityTaskFailedEventAttributes().GetScheduledEventId(), "failed", at)

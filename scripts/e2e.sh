@@ -2,7 +2,8 @@
 # End to end through the published ports, against `make demo`: order, see the
 # cart wait for the member with no Worker running, replace the agent's process,
 # pay, and see a new Worker finish the order without repeating a model or tool
-# call, with one charge in the store's ledger.
+# call, with one charge in the store's ledger. Then the kitchen marks it ready
+# and another new Worker tells the member.
 set -eu
 API=${API:-http://localhost:8080}
 JAR=$(mktemp); OTHER=$(mktemp); trap 'rm -f "$JAR" "$OTHER"' EXIT
@@ -49,15 +50,24 @@ code=$(post "/api/orders/$ID/pay" "{\"quoteId\":\"$quote\"}")
 [ "$code" = 202 ] || { echo "FAIL: pay returned $code"; exit 1; }
 echo "ok: payment accepted with no Worker running"
 
-wait_for "v['order']['phase'] == 'placed' and v['order']['status'] == 'Completed'" 90 "a new Worker resumed and placed the order"
+wait_for "v['order']['phase'] == 'preparing'" 90 "a new Worker resumed and placed the order"
+# Sandbox 2 finishes its work in seconds, so see it running before seeing it drain.
+wait_for "v['worker']['running']" 30 "sandbox 2 is running"
+wait_for "not v['worker']['running']" 90 "the Worker drained while the kitchen makes the order"
+
+code=$(post "/api/orders/$ID/ready" '{}')
+[ "$code" = 202 ] || { echo "FAIL: ready returned $code"; exit 1; }
+echo "ok: kitchen marked it ready with no Worker running"
+
+wait_for "v['order']['phase'] == 'ready' and v['order']['status'] == 'Completed'" 90 "a new Worker told the member it's ready for pickup"
 view | python3 -c "
 import json, sys
 o = json.load(sys.stdin)['order']
 p, ledger = o['proof'], o['ledger']
 before = int(sys.argv[1])
 assert p['repeats'] == 0, p
-assert len(p['workers']) >= 2 and p['workers'][0] != p['workers'][-1], p['workers']
-assert p['modelCalls'] == before + 1, (before, p['modelCalls'])
+assert len(p['workers']) >= 3 and p['workers'][0] != p['workers'][-1], p['workers']
+assert p['modelCalls'] == before + 2, (before, p['modelCalls'])
 for name in ('charge_payment', 'place_order', 'award_stardust'):
     assert sum(r['name'] == name for r in p['rows']) == 1, name
 kinds = sorted(e['kind'] for e in ledger['entries'])

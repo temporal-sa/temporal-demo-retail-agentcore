@@ -19,6 +19,7 @@ const (
 	workflowType  = "CrewOrderWorkflow"
 	signalPay     = "pay"
 	signalMessage = "message"
+	signalReady   = "kitchen_ready"
 )
 
 // Server holds the API's dependencies. NewServer returns its handler.
@@ -44,6 +45,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /api/orders", s.handleStart)
 	mux.HandleFunc("POST /api/orders/{id}/pay", s.handlePay)
 	mux.HandleFunc("POST /api/orders/{id}/messages", s.handleMessage)
+	mux.HandleFunc("POST /api/orders/{id}/ready", s.handleReady)
 	return mux
 }
 
@@ -117,6 +119,11 @@ func (s *Server) handleView(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	view.Order = s.orderView(orderID, wid, desc, proof, ledger)
+	// A Worker that ran a task for this order within the heartbeat window is
+	// running, even if its first heartbeat (every 10 s) hasn't arrived yet.
+	if !view.Worker.Running && proof.LastWorker != "" && view.ServerTime.Sub(proof.LastWorkerAt) < heartbeatFresh {
+		view.Worker = WorkerStatus{Known: true, Running: true, Identity: proof.LastWorker}
+	}
 	writeJSON(w, http.StatusOK, view)
 }
 
@@ -222,6 +229,16 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.signal(w, r, signalMessage, map[string]any{"text": req.Text})
+}
+
+// handleReady is the kitchen marking a paid order ready for pickup, as a
+// Signal for the same reason as handlePay: no Worker needs to be running.
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	if !orderPattern.MatchString(r.PathValue("id")) {
+		s.problem(w, http.StatusBadRequest, "Invalid order ID", "An order ID is 8 lowercase hex characters.")
+		return
+	}
+	s.signal(w, r, signalReady, map[string]any{})
 }
 
 func (s *Server) orderSignal(w http.ResponseWriter, r *http.Request, body any) bool {
